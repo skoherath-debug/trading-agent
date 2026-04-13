@@ -110,7 +110,9 @@ def debug_data():
     try:
         import yfinance as yf
         import pandas as pd
-        df = yf.download("GC=F", period="5d", interval="1h", auto_adjust=False, progress=False)
+        import yfinance as yf
+        ticker = yf.Ticker("GC=F")
+        df = ticker.history(period="5d", interval="1h")
         raw_len = len(df)
         raw_index_type = str(type(df.index))
         raw_cols = list(df.columns)
