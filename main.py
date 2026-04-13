@@ -106,41 +106,31 @@ def health():
 
 @api.get("/debug-data")
 def debug_data():
-    """Debug endpoint — test yfinance data download directly."""
+    """Debug endpoint — test both data sources."""
+    result = {}
     try:
-        import yfinance as yf
-        import pandas as pd
-        import yfinance as yf
-        ticker = yf.Ticker("GC=F")
-        df = ticker.history(period="5d", interval="1h")
-        raw_len = len(df)
-        raw_index_type = str(type(df.index))
-        raw_cols = list(df.columns)
-
-        # Fix index
-        df.index = pd.to_datetime(df.index)
-        try:
-            df.index = df.index.tz_convert(None)
-        except Exception:
-            try:
-                df.index = df.index.tz_localize(None)
-            except Exception:
-                pass
-
-        # Check dayofweek
-        dow = df.index.dayofweek.tolist()[:5]
-        df2 = df[df.index.dayofweek < 5]
-
-        return {
-            "raw_rows": raw_len,
-            "index_type": raw_index_type,
-            "columns": raw_cols,
-            "after_filter_rows": len(df2),
-            "sample_dow": dow,
-            "last_date": str(df.index[-1]) if len(df) > 0 else "empty"
+        import requests as _req
+        r = _req.get("https://api.twelvedata.com/time_series", params={
+            "symbol":"XAU/USD","interval":"1h","outputsize":10,
+            "apikey":"2c3dff7091284f92b2361649006448a8","timezone":"UTC","format":"JSON"
+        }, timeout=30)
+        data = r.json()
+        result["twelvedata"] = {
+            "ok": "values" in data,
+            "rows": len(data.get("values",[])),
+            "msg": data.get("message","") if "values" not in data else "OK",
+            "sample": data.get("values",[{}])[0] if "values" in data else {}
         }
     except Exception as e:
-        return {"error": str(e)}
+        result["twelvedata"] = {"ok": False, "msg": str(e)}
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker("GC=F")
+        df = ticker.history(period="1d", interval="1h")
+        result["yfinance"] = {"ok": len(df)>0, "rows": len(df)}
+    except Exception as e:
+        result["yfinance"] = {"ok": False, "msg": str(e)}
+    return result
 
 @api.get("/files")
 def check_files():
