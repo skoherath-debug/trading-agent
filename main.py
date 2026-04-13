@@ -1,6 +1,5 @@
 """
 XAU/USD Triple Brain Agent — Railway Deployment
-Runs 24/7 on Railway free tier. No Colab needed.
 """
 import os, sys, json, pickle, threading, time, traceback
 import numpy as np
@@ -12,27 +11,67 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 # ── Download models on startup ────────────────────────────────────────────────
-from download_models import download_all
-print("Checking model files...")
-download_all()
+MODELS_DIR = "/app/models"
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+def download_file(file_id, dest):
+    """Download from Google Drive using direct download URL."""
+    if os.path.exists(dest):
+        print(f"✅ Already exists: {dest}")
+        return True
+    if not file_id or file_id == "PASTE_PKL_ID_HERE" or file_id == "PASTE_JSON_ID_HERE" or file_id == "PASTE_TPSL_ID_HERE":
+        print(f"⚠️  No file ID set for {dest}")
+        return False
+    try:
+        print(f"Downloading {os.path.basename(dest)}...")
+        # Try direct download first
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        session = req.Session()
+        r = session.get(url, stream=True, timeout=60)
+        # Handle Google's virus scan warning for large files
+        for key, value in r.cookies.items():
+            if key.startswith("download_warning"):
+                url = f"https://drive.google.com/uc?export=download&confirm={value}&id={file_id}"
+                r = session.get(url, stream=True, timeout=60)
+                break
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=32768):
+                if chunk:
+                    f.write(chunk)
+        size = os.path.getsize(dest)
+        print(f"✅ Downloaded: {os.path.basename(dest)} ({size:,} bytes)")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to download {os.path.basename(dest)}: {e}")
+        if os.path.exists(dest):
+            os.remove(dest)
+        return False
+
+# Download all model files
+PKL_ID  = os.environ.get("MODEL_PKL_ID",  "")
+JSON_ID = os.environ.get("MODEL_JSON_ID", "")
+TPSL_ID = os.environ.get("TPSL_JSON_ID",  "")
+
+download_file(PKL_ID,  f"{MODELS_DIR}/brain1_xgboost_v4.pkl")
+download_file(JSON_ID, f"{MODELS_DIR}/brain1_features_v4.json")
+download_file(TPSL_ID, f"{MODELS_DIR}/dynamic_tpsl_config.json")
 
 # ── Load trading agent ────────────────────────────────────────────────────────
-MODELS_DIR = "/app/models"
-sys.path.insert(0, MODELS_DIR)
+try:
+    AGENT_CODE = open("/app/trading_agent.py").read()
+    AGENT_CODE = AGENT_CODE.replace(
+        '"/content/drive/MyDrive/trading_agent/',
+        f'"{MODELS_DIR}/'
+    )
+    exec(AGENT_CODE, globals())
+    print("✅ Trading agent loaded")
+except Exception as e:
+    print(f"❌ Failed to load trading agent: {e}")
 
-# Override Drive paths to use local /app/models/
-AGENT_CODE = open("/app/trading_agent.py").read()
-AGENT_CODE = AGENT_CODE.replace(
-    '"/content/drive/MyDrive/trading_agent/',
-    f'"{MODELS_DIR}/'
-)
-exec(AGENT_CODE, globals())
-print("✅ Trading agent loaded")
-
-# ── Config from environment ───────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8172828888:AAFWCvtCl1F-Kj5yOv_EFEB9vxL-ir-dD9I")
-TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT",  "7132630179")
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY",   GROQ_API_KEY)
+# ── Config ────────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT",  "")
 RUN_INTERVAL   = int(os.environ.get("RUN_INTERVAL", "3600"))
 
 # ── numpy cleaner ─────────────────────────────────────────────────────────────
@@ -64,6 +103,23 @@ def root():
 def health():
     return {"status": "ok", "agent": "XAU/USD Triple Brain v4",
             "time": datetime.now(timezone.utc).isoformat()}
+
+@api.get("/files")
+def check_files():
+    """Debug endpoint — check if model files are downloaded."""
+    files = {}
+    for fname in ["brain1_xgboost_v4.pkl", "brain1_features_v4.json", "dynamic_tpsl_config.json"]:
+        path = f"{MODELS_DIR}/{fname}"
+        files[fname] = {
+            "exists": os.path.exists(path),
+            "size": os.path.getsize(path) if os.path.exists(path) else 0
+        }
+    env = {
+        "MODEL_PKL_ID":  PKL_ID[:8]+"..." if PKL_ID else "NOT SET",
+        "MODEL_JSON_ID": JSON_ID[:8]+"..." if JSON_ID else "NOT SET",
+        "TPSL_JSON_ID":  TPSL_ID[:8]+"..." if TPSL_ID else "NOT SET",
+    }
+    return {"files": files, "env_ids": env}
 
 @api.post("/run-analysis")
 def run_analysis_endpoint():
@@ -105,7 +161,7 @@ def session_status():
     q, allowed = _get_session_quality()
     return {"quality": q, "trade_allowed": allowed}
 
-# ── Background scheduler ──────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 def tg(msg):
     try:
         req.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -127,9 +183,10 @@ def check_health(result):
             tg(f"✅ RECOVERED: {key}")
     _prev_health = {k: dict(v) for k, v in health.items()}
 
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 def scheduler():
-    time.sleep(10)
-    tg(f"🚀 AGENT STARTED (Railway)\nScheduler: every {RUN_INTERVAL//60} min\nTime: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\nDashboard: ceylonpropertylink.com/agent/dashboard.html")
+    time.sleep(15)
+    tg(f"🚀 AGENT STARTED (Railway 24/7)\nScheduler: every {RUN_INTERVAL//60} min\nTime: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\nDashboard: ceylonpropertylink.com/agent/dashboard.html")
     while True:
         now = datetime.now(timezone.utc).strftime("%H:%M UTC")
         print(f"[SCHEDULER] {now}")
