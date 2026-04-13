@@ -7,6 +7,33 @@ import pandas as pd
 import json as _json
 import pandas as _pd
 
+
+# ── Phase 26 Fix: Twelve Data (replaces yfinance for Railway) ─────────────────
+_TWELVE_KEY = "2c3dff7091284f92b2361649006448a8"
+
+def _get_ohlcv_twelvedata(symbol="XAU/USD", interval="1h", outputsize=500):
+    import requests as _req
+    try:
+        r = _req.get("https://api.twelvedata.com/time_series", params={
+            "symbol": symbol, "interval": interval,
+            "outputsize": outputsize, "apikey": _TWELVE_KEY,
+            "timezone": "UTC", "format": "JSON"
+        }, timeout=30)
+        data = r.json()
+        if "values" not in data:
+            return None
+        df = pd.DataFrame(data["values"])
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.set_index("datetime").sort_index()
+        for col in ["open","high","low","close","volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df[["open","high","low","close","volume"]].dropna()
+    except Exception as e:
+        print(f"[TWELVEDATA] Error: {e}")
+        return None
+# ─────────────────────────────────────────────────────────────────────────────
+
 def calculate_atr_dynamic(df, period=14):
     """Wilder ATR."""
     h, l, c = df["high"], df["low"], df["close"]
@@ -901,11 +928,13 @@ def run_analysis():
 
     # Data feed
     try:
-        _ticker = yf.Ticker(SYMBOL)
-        df = _ticker.history(period="60d", interval="1h")
-        df.columns = [c.lower() for c in df.columns]
-        df = df[[c for c in ["open","high","low","close","volume"] if c in df.columns]]
-        df = df.dropna()
+        df = _get_ohlcv_twelvedata("XAU/USD", "1h", 500)
+        if df is None or len(df) == 0:
+            _ticker = yf.Ticker(SYMBOL)
+            df = _ticker.history(period="60d", interval="1h")
+            df.columns = [c.lower() for c in df.columns]
+            df = df[[c for c in ["open","high","low","close","volume"] if c in df.columns]]
+            df = df.dropna()
         df = df[df.index.dayofweek<5]; df = df[df["volume"]>0]
         if len(df) < 50:
             raise ValueError(f"Only {len(df)} rows — feed may be stale")
