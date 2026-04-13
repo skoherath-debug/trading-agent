@@ -109,7 +109,11 @@ def root():
 def health():
     return {"status": "ok", "agent": "XAU/USD Triple Brain v4",
             "time": datetime.now(timezone.utc).isoformat()}
+last_result = {}
 
+@api.get("/status")
+async def get_status():
+    return last_result if last_result else {"signal": "WAIT", "msg": "No analysis yet"}
 @api.get("/debug-data")
 def debug_data():
     """Debug endpoint — test both data sources."""
