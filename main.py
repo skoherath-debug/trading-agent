@@ -85,7 +85,13 @@ def clean(obj):
     return obj
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
-api = FastAPI(title="XAU/USD Triple Brain Agent")
+api = FastAPI(title="XAU/USD Triple Brain Agent")from fastapi.middleware.cors import CORSMiddleware
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 api.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
