@@ -194,7 +194,12 @@ def daily_summary():
 def session_status():
     q, allowed = _get_session_quality()
     return {"quality": q, "trade_allowed": allowed}
-
+@api.post("/telegram/send")
+async def telegram_send(body: dict):
+    msg = body.get("message", "Test")
+    # use your existing send_telegram() function
+    await send_telegram(msg)
+    return {"ok": True}
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def tg(msg):
     try:
