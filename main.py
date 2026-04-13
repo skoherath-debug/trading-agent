@@ -160,19 +160,25 @@ def run_analysis_endpoint():
 @api.get("/chart-data")
 def chart_data():
     try:
-        import yfinance as yf
-        df = yf.download("GC=F", period="5d", interval="15m",
-                         auto_adjust=False, progress=False)
-        df.columns = [col[0].lower() if isinstance(col,tuple) else col.lower()
-                      for col in df.columns]
-        df = df[["open","high","low","close","volume"]].dropna()
-        df = df[df.index.dayofweek < 5].tail(200)
-        bars = [{"time": int(pd.Timestamp(ts).timestamp()),
-                 "open":  round(float(r["open"]),  2),
-                 "high":  round(float(r["high"]),  2),
-                 "low":   round(float(r["low"]),   2),
-                 "close": round(float(r["close"]), 2)}
-                for ts, r in df.iterrows()]
+        import requests as _req
+        r = _req.get("https://api.twelvedata.com/time_series", params={
+            "symbol":"XAU/USD","interval":"15min","outputsize":200,
+            "apikey":"2c3dff7091284f92b2361649006448a8","timezone":"UTC","format":"JSON"
+        }, timeout=30)
+        data = r.json()
+        if "values" not in data:
+            raise ValueError(data.get("message","No data"))
+        bars = []
+        for v in reversed(data["values"]):
+            try:
+                bars.append({
+                    "time":  int(pd.Timestamp(v["datetime"]).timestamp()),
+                    "open":  round(float(v["open"]),  2),
+                    "high":  round(float(v["high"]),  2),
+                    "low":   round(float(v["low"]),   2),
+                    "close": round(float(v["close"]), 2),
+                })
+            except: pass
         return JSONResponse(content={"bars": bars, "symbol": "XAU/USD", "tf": "15m"})
     except Exception as e:
         return JSONResponse(content={"error": str(e), "bars": []})
