@@ -104,6 +104,42 @@ def health():
     return {"status": "ok", "agent": "XAU/USD Triple Brain v4",
             "time": datetime.now(timezone.utc).isoformat()}
 
+@api.get("/debug-data")
+def debug_data():
+    """Debug endpoint — test yfinance data download directly."""
+    try:
+        import yfinance as yf
+        import pandas as pd
+        df = yf.download("GC=F", period="5d", interval="1h", auto_adjust=False, progress=False)
+        raw_len = len(df)
+        raw_index_type = str(type(df.index))
+        raw_cols = list(df.columns)
+
+        # Fix index
+        df.index = pd.to_datetime(df.index)
+        try:
+            df.index = df.index.tz_convert(None)
+        except Exception:
+            try:
+                df.index = df.index.tz_localize(None)
+            except Exception:
+                pass
+
+        # Check dayofweek
+        dow = df.index.dayofweek.tolist()[:5]
+        df2 = df[df.index.dayofweek < 5]
+
+        return {
+            "raw_rows": raw_len,
+            "index_type": raw_index_type,
+            "columns": raw_cols,
+            "after_filter_rows": len(df2),
+            "sample_dow": dow,
+            "last_date": str(df.index[-1]) if len(df) > 0 else "empty"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 @api.get("/files")
 def check_files():
     """Debug endpoint — check if model files are downloaded."""
