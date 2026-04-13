@@ -904,15 +904,8 @@ def run_analysis():
         df = yf.download(SYMBOL, period="60d", interval="1h", auto_adjust=False, progress=False)
         df.columns = [col[0].lower() if isinstance(col,tuple) else col.lower() for col in df.columns]
         df = df[["open","high","low","close","volume"]].dropna()
-        df.index = pd.to_datetime(df.index)
-        try:
-            df.index = df.index.tz_localize(None)
-        except Exception:
-            try:
-                df.index = df.index.tz_convert(None)
-            except Exception:
-                pass
-        df = df[pd.to_datetime(df.index).dayofweek<5]; df = df[df["volume"]>0]
+        df = df[df.index.dayofweek<5]
+        # df = df[df["volume"]>0]  # removed — causes empty df on weekends
         if len(df) < 50:
             raise ValueError(f"Only {len(df)} rows — feed may be stale")
         health["data_feed"] = {"ok": True, "msg": f"{len(df)} bars loaded"}
