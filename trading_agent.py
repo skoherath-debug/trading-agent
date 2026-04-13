@@ -512,13 +512,7 @@ def run_trading_agent():
     df=yf.download(SYMBOL,period="60d",interval="1h",auto_adjust=False,progress=False)
     df.columns=[col[0].lower() if isinstance(col,tuple) else col.lower() for col in df.columns]
     df=df[["open","high","low","close","volume"]].dropna()
-    try:
-        df.index = pd.to_datetime(df.index)
-        if hasattr(df.index, "tz") and df.index.tz is not None:
-            df.index = df.index.tz_convert(None)
-    except Exception:
-        pass
-    df=df[pd.DatetimeIndex(df.index).dayofweek<5]
+    df=df[df.index.dayofweek<5]; df=df[df["volume"]>0]
     df_live=build_features_for_brain1v2(df.set_index('datetime') if 'datetime' in df.columns else df)
     print(f"✅ Live data: {len(df_live)} rows")
     X=df_live[features["features"]].iloc[[-1]]; prob=brain1_model.predict_proba(X)[0]
@@ -907,17 +901,13 @@ def run_analysis():
 
     # Data feed
     try:
-        df = yf.download(SYMBOL, period="60d", interval="1h", auto_adjust=False, progress=False)
-        df.columns = [col[0].lower() if isinstance(col,tuple) else col.lower() for col in df.columns]
-        df = df[["open","high","low","close","volume"]].dropna()
-        try:
-            df.index = pd.to_datetime(df.index)
-            if hasattr(df.index, "tz") and df.index.tz is not None:
-                df.index = df.index.tz_convert(None)
-        except Exception:
-            pass
-        df = df[pd.DatetimeIndex(df.index).dayofweek < 5]
-        if len(df) < 10:
+        _ticker = yf.Ticker(SYMBOL)
+        df = _ticker.history(period="60d", interval="1h")
+        df.columns = [c.lower() for c in df.columns]
+        df = df[[c for c in ["open","high","low","close","volume"] if c in df.columns]]
+        df = df.dropna()
+        df = df[df.index.dayofweek<5]; df = df[df["volume"]>0]
+        if len(df) < 50:
             raise ValueError(f"Only {len(df)} rows — feed may be stale")
         health["data_feed"] = {"ok": True, "msg": f"{len(df)} bars loaded"}
     except Exception as e:
