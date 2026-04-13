@@ -7,33 +7,6 @@ import pandas as pd
 import json as _json
 import pandas as _pd
 
-
-# ── Phase 26 Fix: Twelve Data (replaces yfinance for Railway) ─────────────────
-_TWELVE_KEY = "2c3dff7091284f92b2361649006448a8"
-
-def _get_ohlcv_twelvedata(symbol="XAU/USD", interval="1h", outputsize=500):
-    import requests as _req
-    try:
-        r = _req.get("https://api.twelvedata.com/time_series", params={
-            "symbol": symbol, "interval": interval,
-            "outputsize": outputsize, "apikey": _TWELVE_KEY,
-            "timezone": "UTC", "format": "JSON"
-        }, timeout=30)
-        data = r.json()
-        if "values" not in data:
-            return None
-        df = pd.DataFrame(data["values"])
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df = df.set_index("datetime").sort_index()
-        for col in ["open","high","low","close","volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df[["open","high","low","close","volume"]].dropna()
-    except Exception as e:
-        print(f"[TWELVEDATA] Error: {e}")
-        return None
-# ─────────────────────────────────────────────────────────────────────────────
-
 def calculate_atr_dynamic(df, period=14):
     """Wilder ATR."""
     h, l, c = df["high"], df["low"], df["close"]
@@ -928,15 +901,41 @@ def run_analysis():
 
     # Data feed
     try:
-        df = _get_ohlcv_twelvedata("XAU/USD", "1h", 500)
-        if df is None or len(df) == 0:
-            _ticker = yf.Ticker(SYMBOL)
-            df = _ticker.history(period="60d", interval="1h")
-            df.columns = [c.lower() for c in df.columns]
-            df = df[[c for c in ["open","high","low","close","volume"] if c in df.columns]]
-            df = df.dropna()
-        df = df[df.index.dayofweek<5]; df = df[df["volume"]>0]
-        if len(df) < 50:
+        # Try Twelve Data first (works on Railway/servers)
+        _td_df = None
+        try:
+            import requests as _req
+            _r = _req.get("https://api.twelvedata.com/time_series", params={
+                "symbol":"XAU/USD","interval":"1h","outputsize":500,
+                "apikey":"2c3dff7091284f92b2361649006448a8","timezone":"UTC","format":"JSON"
+            }, timeout=30)
+            _td = _r.json()
+            if "values" in _td:
+                _td_df = pd.DataFrame(_td["values"])
+                _td_df["datetime"] = pd.to_datetime(_td_df["datetime"])
+                _td_df = _td_df.set_index("datetime").sort_index()
+                for _c in ["open","high","low","close","volume"]:
+                    if _c in _td_df.columns:
+                        _td_df[_c] = pd.to_numeric(_td_df[_c], errors="coerce")
+                _td_df = _td_df[["open","high","low","close","volume"]].dropna()
+        except Exception as _e:
+            print(f"[DATA] Twelve Data failed: {_e}")
+
+        if _td_df is not None and len(_td_df) > 50:
+            df = _td_df
+        else:
+            # Fallback to yfinance
+            df = yf.download(SYMBOL, period="60d", interval="1h", auto_adjust=False, progress=False)
+            df.columns = [col[0].lower() if isinstance(col,tuple) else col.lower() for col in df.columns]
+            df = df[["open","high","low","close","volume"]].dropna()
+            df.index = pd.to_datetime(df.index)
+            try:
+                df.index = df.index.tz_convert(None)
+            except Exception:
+                pass
+            df = df[df.index.dayofweek < 5]
+
+        if len(df) < 10:
             raise ValueError(f"Only {len(df)} rows — feed may be stale")
         health["data_feed"] = {"ok": True, "msg": f"{len(df)} bars loaded"}
     except Exception as e:
