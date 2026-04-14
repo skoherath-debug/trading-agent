@@ -913,7 +913,7 @@ def run_analysis():
             import requests as _req
             _r = _req.get("https://api.twelvedata.com/time_series", params={
                 "symbol":"XAU/USD","interval":"1h","outputsize":500,
-                "apikey":"2c3dff7091284f92b2361649006448a8","timezone":"UTC","format":"JSON"
+                "apikey": TD_KEY,"timezone":"UTC","format":"JSON"
             }, timeout=30)
             _td = _r.json()
             if "values" in _td:
