@@ -888,16 +888,22 @@ def run_analysis():
     }
 
     # Load model
+    _b1_use_fallback = False
     try:
         with open("/content/drive/MyDrive/trading_agent/brain1_xgboost_v4.pkl","rb") as f:
             brain1_model = pickle.load(f)
+        # Validate model has predict_proba (detect corrupt pkl)
+        if not hasattr(brain1_model, 'predict_proba'):
+            raise ValueError(f"Loaded object is {type(brain1_model).__name__}, not XGBoost. PKL file is corrupt (0.9KB). Re-upload model to Google Drive.")
         with open("/content/drive/MyDrive/trading_agent/brain1_features_v4.json","r") as f:
             features = json.load(f)
         THRESHOLD = features.get("threshold", 0.74)
     except Exception as e:
-        health["brain1"] = {"ok": False, "msg": f"Model load failed: {e}"}
-        return {"signal":"ERROR","confidence":0,"price":None,"health":health,
-                "timestamp":datetime.now(timezone.utc).isoformat()}
+        print(f"[B1] Model load failed: {e} — using technical fallback")
+        health["brain1"] = {"ok": False, "msg": f"Model failed: {e} — using fallback"}
+        _b1_use_fallback = True
+        THRESHOLD = 0.74
+        features = {"features": []}
 
     # Data feed
     try:
@@ -955,15 +961,52 @@ def run_analysis():
 
     # Brain 1
     try:
-        missing = [f for f in features["features"] if f not in df_live.columns]
-        if missing:
-            raise ValueError(f"Missing features: {missing[:3]}{'...' if len(missing)>3 else ''}")
-        X = df_live[features["features"]].iloc[[-1]]
-        prob = brain1_model.predict_proba(X)[0]
-        b1_buy = prob[1]; b1_sell = prob[0]
-        b1_dir = "BUY" if b1_buy>=THRESHOLD else "SELL" if b1_sell>=THRESHOLD else "WAIT"
-        b1_score = b1_buy*10
-        health["brain1"] = {"ok": True, "msg": f"prob={round(b1_buy,3)} threshold={THRESHOLD}"}
+        if _b1_use_fallback:
+            # ── FALLBACK B1: Technical indicator scoring ──────────────
+            row = df_live.iloc[-1]
+            _score = 5.0  # neutral start
+            # RSI signal
+            _rsi = row.get("rsi_14", 50)
+            if _rsi < 30: _score += 2.0   # oversold = buy
+            elif _rsi < 40: _score += 1.0
+            elif _rsi > 70: _score -= 2.0  # overbought = sell
+            elif _rsi > 60: _score -= 1.0
+            # EMA crossover
+            _ema5 = row.get("ema_5", 0)
+            _ema20 = row.get("ema_20", 0)
+            if _ema5 and _ema20:
+                if _ema5 > _ema20: _score += 1.0
+                else: _score -= 1.0
+            # MACD
+            _macd_h = row.get("macd_hist", 0)
+            if _macd_h > 0: _score += 0.5
+            elif _macd_h < 0: _score -= 0.5
+            # Bollinger position
+            _bb = row.get("bb_pct_20", 0.5)
+            if _bb < 0.1: _score += 1.5   # near lower band
+            elif _bb > 0.9: _score -= 1.5  # near upper band
+            # Stochastic
+            _stoch = row.get("stoch_k", 50)
+            if _stoch < 20: _score += 1.0
+            elif _stoch > 80: _score -= 1.0
+            # Clamp to 0-10
+            _score = max(0.0, min(10.0, _score))
+            b1_buy = _score / 10.0
+            b1_sell = 1.0 - b1_buy
+            b1_dir = "BUY" if b1_buy >= 0.65 else "SELL" if b1_sell >= 0.65 else "WAIT"
+            b1_score = _score
+            health["brain1"] = {"ok": True, "msg": f"FALLBACK mode: score={round(_score,2)} RSI={round(_rsi,1)} BB={round(_bb,2)} Stoch={round(_stoch,1)}"}
+            print(f"   B1 FALLBACK: score={_score:.2f} RSI={_rsi:.1f} BB={_bb:.2f} Stoch={_stoch:.1f}")
+        else:
+            missing = [f for f in features["features"] if f not in df_live.columns]
+            if missing:
+                raise ValueError(f"Missing features: {missing[:3]}{'...' if len(missing)>3 else ''}")
+            X = df_live[features["features"]].iloc[[-1]]
+            prob = brain1_model.predict_proba(X)[0]
+            b1_buy = prob[1]; b1_sell = prob[0]
+            b1_dir = "BUY" if b1_buy>=THRESHOLD else "SELL" if b1_sell>=THRESHOLD else "WAIT"
+            b1_score = b1_buy*10
+            health["brain1"] = {"ok": True, "msg": f"XGBoost prob={round(b1_buy,3)} threshold={THRESHOLD}"}
     except Exception as e:
         health["brain1"] = {"ok": False, "msg": f"Inference failed: {e}"}
         b1_buy=0.5; b1_sell=0.5; b1_dir="WAIT"; b1_score=5.0
