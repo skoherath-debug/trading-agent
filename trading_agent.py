@@ -923,7 +923,9 @@ def run_analysis():
                 for _c in ["open","high","low","close","volume"]:
                     if _c in _td_df.columns:
                         _td_df[_c] = pd.to_numeric(_td_df[_c], errors="coerce")
-                _td_df = _td_df[["open","high","low","close","volume"]].dropna()
+                _td_df = _td_df[[c for c in ["open","high","low","close"] if c in _td_df.columns]].dropna()
+                if "volume" not in _td_df.columns:
+                    _td_df["volume"] = 0   # TD free tier has no volume — fill with 0
         except Exception as _e:
             print(f"[DATA] Twelve Data failed: {_e}")
 
