@@ -799,20 +799,26 @@ def build_features_for_brain1v2(df):
 TELEGRAM_TOKEN = "8172828888:AAFWCvtCl1F-Kj5yOv_EFEB9vxL-ir-dD9I"
 TELEGRAM_CHAT  = "7132630179"
 
-def send_telegram(signal, price, score, b1_prob, b2_score, atr, h4=None):
+def send_telegram(signal, price, score, b1_prob, b2_score, atr, h4=None, tp=None, sl=None):
     if signal not in ["BUY","SELL"]:
         return
-    _tp_usd, _sl_usd, tp, sl = get_dynamic_tpsl(df, signal, price)
+    # Use passed tp/sl, or calculate from ATR if not provided
+    if tp is None or sl is None:
+        tp = round(price + atr*1.5, 2) if signal=="BUY" else round(price - atr*1.5, 2)
+        sl = round(price - atr,     2) if signal=="BUY" else round(price + atr,     2)
+    _tp_usd = round(abs(tp - price) * 3, 2)   # 0.03 lot × 100
+    _sl_usd = round(abs(sl - price) * 3, 2)
+    rr = round(_tp_usd / _sl_usd, 2) if _sl_usd > 0 else 0
     icon = "🟢" if signal=="BUY" else "🔴"
     h4_line = ""
     if h4:
         h4_icon = "📈" if h4["direction"]=="BUY" else "📉" if h4["direction"]=="SELL" else "➡️"
-        h4_line = f"H4     : {h4_icon} {h4['direction']} | RSI {h4['rsi']}\n"
+        h4_line = f"H4     : {h4_icon} {h4['direction']} | RSI {h4.get('rsi','—')}\n"
     msg = (
         f"{icon} {signal} XAU/USD\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Entry  : ${price:,.2f}\n"
-        f"TP     : ${tp:,.2f}  (+${round(abs(tp-price),2)})\n"
+        f"TP1    : ${tp:,.2f}  (+${round(abs(tp-price),2)})\n"
         f"SL     : ${sl:,.2f}  (-${round(abs(sl-price),2)})\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Score  : {round(score,2)}/10\n"
@@ -821,7 +827,8 @@ def send_telegram(signal, price, score, b1_prob, b2_score, atr, h4=None):
         f"{h4_line}"
         f"ATR    : ${round(atr,2)}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Risk   : ${_sl_usd:.2f} | Reward: ${_tp_usd:.2f} | RR: {round(_tp_usd/_sl_usd,2)}:1"
+        f"Risk   : ${_sl_usd:.2f} | Reward: ${_tp_usd:.2f} | RR: {rr}:1\n"
+        f"Open trade on Exness NOW!"
     )
     try:
         r = requests.post(
@@ -1093,7 +1100,7 @@ def run_analysis():
         health["brain3"] = {"ok": False, "msg": f"Groq API error: {e}"}
 
     try:
-        send_telegram(sig, price, fused, b1_buy, b2_score, atr, h4)
+        send_telegram(sig, price, fused, b1_buy, b2_score, atr, h4, tp=tp, sl=sl)
         health["telegram"] = {"ok": True, "msg": "alert sent" if sig in ("BUY","SELL") else "standby"}
     except Exception as e:
         health["telegram"] = {"ok": False, "msg": f"Telegram failed: {e}"}
