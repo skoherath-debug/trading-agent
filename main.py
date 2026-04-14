@@ -108,14 +108,33 @@ def clean(obj):
 
 # ── Download models from Google Drive ────────────────────────
 def download_file(file_id, dest):
+    # Check if file exists AND is valid (pkl files should be > 5KB for a real model)
     if os.path.exists(dest):
-        print("EXISTS: " + os.path.basename(dest))
-        return True
+        fsize = os.path.getsize(dest)
+        if dest.endswith(".pkl") and fsize < 5000:
+            print(f"CORRUPT: {os.path.basename(dest)} is only {fsize} bytes — re-downloading")
+            os.remove(dest)
+        else:
+            print("EXISTS: " + os.path.basename(dest) + " (" + str(fsize) + " bytes)")
+            return True
     if not file_id or "PASTE" in file_id:
         print("NO ID: " + os.path.basename(dest))
         return False
     try:
         print("DOWNLOADING: " + os.path.basename(dest))
+        # Try gdown first (handles large files better)
+        try:
+            import gdown
+            gdown.download(f"https://drive.google.com/uc?id={file_id}", dest, quiet=False)
+            if os.path.exists(dest) and os.path.getsize(dest) > 5000:
+                print("OK (gdown): " + os.path.basename(dest) + " (" + str(os.path.getsize(dest)) + " bytes)")
+                return True
+            elif os.path.exists(dest):
+                print(f"WARN: gdown downloaded only {os.path.getsize(dest)} bytes — trying direct")
+                os.remove(dest)
+        except Exception as ge:
+            print(f"gdown failed: {ge} — trying direct download")
+        # Fallback: direct download with confirmation bypass
         url = "https://drive.google.com/uc?export=download&id=" + file_id
         session = req.Session()
         r = session.get(url, stream=True, timeout=60)
@@ -128,7 +147,17 @@ def download_file(file_id, dest):
             for chunk in r.iter_content(32768):
                 if chunk:
                     f.write(chunk)
-        print("OK: " + os.path.basename(dest) + " (" + str(os.path.getsize(dest)) + " bytes)")
+        fsize = os.path.getsize(dest)
+        # Validate: check if we got HTML instead of binary
+        if fsize < 5000 and dest.endswith(".pkl"):
+            with open(dest, "rb") as f:
+                header = f.read(20)
+            if b"<!DOCTYPE" in header or b"<html" in header:
+                print(f"ERROR: Downloaded HTML instead of model. Google Drive sharing may be restricted.")
+                os.remove(dest)
+                return False
+            print(f"WARN: PKL file is only {fsize} bytes — may be corrupt")
+        print("OK: " + os.path.basename(dest) + " (" + str(fsize) + " bytes)")
         return True
     except Exception as e:
         print("FAILED: " + str(e))
