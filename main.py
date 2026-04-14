@@ -51,7 +51,7 @@ RUN_INTERVAL   = int(os.environ.get("RUN_INTERVAL", "300"))
 PKL_ID         = os.environ.get("MODEL_PKL_ID", "")
 JSON_ID        = os.environ.get("MODEL_JSON_ID", "")
 TPSL_ID        = os.environ.get("TPSL_JSON_ID", "")
-TD_KEY         = os.environ.get("TD_KEY", "")          # ← set in Railway env vars
+TD_KEY         = os.environ.get("TD_KEY", "")
 MODELS_DIR     = "/app/models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -219,23 +219,27 @@ _prev_health  = {}
 _run_count    = 0
 
 # ── Smart interval: 2 min trading hours, 30 min off-hours ─────
-# Trading hours = 07:00–18:00 UTC (12:30–23:30 Sri Lanka, UTC+5:30)
-# 11hr × 2min = 330 runs + 330 chart = ~660 credits/day ✅
 def get_run_interval():
     t = datetime.now(timezone.utc)
     mins = t.hour * 60 + t.minute
-    if 420 <= mins < 1080:   # 07:00–18:00 UTC
-        return 120           # 2 min — maximum accuracy during trading
-    return 1800              # 30 min — keepalive only outside trading hours
+    if 420 <= mins < 1080:   # 07:00-18:00 UTC
+        return 120
+    return 1800
 
-# ── Chart cache (visual only — no accuracy impact) ────────────
+# ── Live price cache (30s TTL, zero extra scheduler cost) ──────
+_price_cache = {"price": None, "ts": 0.0}
+
+# ── Chart cache (2 min) ────────────────────────────────────────
 _chart_cache      = {"bars": [], "ts": 0.0}
-CHART_CACHE_TTL   = 120   # 2 min cache (matches scheduler interval)
+CHART_CACHE_TTL   = 120
 
 def _save_result(result):
-    global last_result, last_run_time
+    global last_result, last_run_time, _price_cache
     last_result   = result
     last_run_time = datetime.now(timezone.utc).isoformat()
+    # Update price cache from scheduler result (free)
+    if result.get("price"):
+        _price_cache = {"price": result["price"], "ts": time.time()}
 
 def _check_health(result):
     global _prev_health
@@ -330,30 +334,47 @@ def run_ep():
             "error":  str(e)
         }, status_code=500)
 
+@api.get("/live-price")
+def live_price_ep():
+    """Returns current XAU/USD price with 30s Railway-side cache. ~1 TD credit per 30s."""
+    global _price_cache
+    now = time.time()
+    if _price_cache["price"] and (now - _price_cache["ts"]) < 30:
+        return JSONResponse(content={"price": _price_cache["price"], "cached": True,
+                                     "time": last_run_time or ""})
+    if not TD_KEY:
+        return JSONResponse(content={"price": last_result.get("price"), "cached": True})
+    try:
+        r = req.get("https://api.twelvedata.com/price",
+                    params={"symbol": "XAU/USD", "apikey": TD_KEY}, timeout=8)
+        data = r.json()
+        if "price" in data:
+            price = round(float(data["price"]), 2)
+            _price_cache = {"price": price, "ts": now}
+            if last_result:
+                last_result["price"] = price
+            return JSONResponse(content={"price": price, "cached": False,
+                                         "time": datetime.now(timezone.utc).isoformat()})
+    except Exception as e:
+        print(f"[LIVE PRICE] {e}")
+    return JSONResponse(content={"price": last_result.get("price"), "cached": True})
+
 @api.get("/chart-data")
 def chart_ep():
     global _chart_cache
-    # Serve from cache if fresh (3 min TTL — chart is visual only, no accuracy impact)
     if _chart_cache["bars"] and (time.time() - _chart_cache["ts"]) < CHART_CACHE_TTL:
-        return JSONResponse(content={
-            "bars": _chart_cache["bars"], "symbol": "XAU/USD", "tf": "15m", "cached": True
-        })
+        return JSONResponse(content={"bars": _chart_cache["bars"], "symbol": "XAU/USD",
+                                     "tf": "15m", "cached": True})
     try:
         r = req.get(
             "https://api.twelvedata.com/time_series",
-            params={
-                "symbol":     "XAU/USD",
-                "interval":   "15min",
-                "outputsize": 200,
-                "apikey":     TD_KEY,
-                "timezone":   "UTC",
-                "format":     "JSON"
-            },
+            params={"symbol":"XAU/USD","interval":"15min","outputsize":200,
+                    "apikey":TD_KEY,"timezone":"UTC","format":"JSON"},
             timeout=30
         )
         data = r.json()
         if "values" not in data:
-            raise ValueError(data.get("message", "No data from Twelve Data"))
+            raise ValueError(data.get("message", "No data"))
         bars = []
         for v in reversed(data["values"]):
             try:
@@ -366,16 +387,13 @@ def chart_ep():
                 })
             except Exception:
                 pass
-        # Update cache
         _chart_cache["bars"] = bars
         _chart_cache["ts"]   = time.time()
         return JSONResponse(content={"bars": bars, "symbol": "XAU/USD", "tf": "15m"})
     except Exception as e:
-        # Return stale cache if available, else empty
         if _chart_cache["bars"]:
-            return JSONResponse(content={
-                "bars": _chart_cache["bars"], "symbol": "XAU/USD", "tf": "15m", "cached": True, "stale": True
-            })
+            return JSONResponse(content={"bars": _chart_cache["bars"], "symbol": "XAU/USD",
+                                         "tf": "15m", "cached": True, "stale": True})
         return JSONResponse(content={"error": str(e), "bars": []}, status_code=500)
 
 @api.post("/telegram/send")
@@ -440,7 +458,7 @@ def scheduler():
     
     tg(
         "AGENT STARTED - Railway 24/7\n"
-        "Interval: 2 min trading (07:00-18:00 UTC) / 30 min off-hours\n"
+        "Interval: 2min trading (07-18 UTC) / 30min off-hours\n"
         "Session: " + sname + "\n"
         "Time: " + datetime.now(timezone.utc).strftime("%H:%M UTC") + "\n"
         "Phase 28: Improvements " + ("ENABLED ✅" if IMPROVEMENTS_LOADED else "DISABLED ⚠️") + "\n"
@@ -574,5 +592,5 @@ def scheduler():
 
 
 threading.Thread(target=scheduler, daemon=True).start()
-print("Scheduler started - 2 min trading (07:00-18:00 UTC) / 30 min off-hours")
+print("Scheduler started - 2min trading / 30min off-hours")
 print("Phase 28 Improvements: " + ("ENABLED ✅" if IMPROVEMENTS_LOADED else "DISABLED ⚠️"))
