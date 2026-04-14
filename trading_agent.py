@@ -925,7 +925,7 @@ def run_analysis():
                         _td_df[_c] = pd.to_numeric(_td_df[_c], errors="coerce")
                 _td_df = _td_df[[c for c in ["open","high","low","close"] if c in _td_df.columns]].dropna()
                 if "volume" not in _td_df.columns:
-                    _td_df["volume"] = 0   # TD free tier has no volume — fill with 0
+                    _td_df["volume"] = 0
         except Exception as _e:
             print(f"[DATA] Twelve Data failed: {_e}")
 
@@ -1065,6 +1065,7 @@ def run_analysis():
     price = round(df_live["close"].iloc[-1], 2)
     atr   = round(m["volatility"]["atr14"], 2)
     tp    = round(price + atr*1.5, 2) if sig=="BUY" else round(price - atr*1.5, 2)
+    tp2   = round(price + atr*2.5, 2) if sig=="BUY" else round(price - atr*2.5, 2)
     sl    = round(price - atr, 2)     if sig=="BUY" else round(price + atr, 2)
 
     # Brain 3
@@ -1102,11 +1103,19 @@ def run_analysis():
         "confidence":   round(fused, 2),
         "price":        price,
         "brain1":       {"prediction": 1 if b1_dir=="BUY" else 0, "probability": round(b1_buy, 3)},
-        "brain2":       {"score": b2_score, "details": {"trend": m["trend"]["direction"], "momentum": m["momentum"]["state"]}},
+        "brain2":       {"score": b2_score, "details": {
+                            "trend": m["trend"]["direction"],
+                            "momentum": m["momentum"]["state"],
+                            "support": m["sr_zones"]["nearest_support"],
+                            "resistance": m["sr_zones"]["nearest_resistance"],
+                            "dist_support_pct": m["sr_zones"]["dist_to_support_pct"],
+                            "dist_resistance_pct": m["sr_zones"]["dist_to_resistance_pct"],
+                        }},
         "brain3":       {"verdict": sig, "reasoning": b3_text},
         "h4":           h4,
         "h4_veto":      h4_veto,
         "tp":           tp,
+        "tp2":          tp2,
         "sl":           sl,
         "atr":          atr,
         "session":      session_quality,
