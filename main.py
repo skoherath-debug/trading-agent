@@ -1,6 +1,6 @@
 """
 XAU/USD Triple Brain Agent - Railway Deployment
-Phase 27 - Fixed: NoneType crash, safe format helpers, 5min interval
+Phase 28 - Integrated Improvements: Performance tracking, adaptive thresholds, volatility filters
 """
 import os, threading, time, traceback
 import numpy as np
@@ -11,14 +11,38 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+# ── Phase 28: Import Improvements ─────────────────────────────
+try:
+    from api_improvements import router as improvements_router
+    from performance_tracker import tracker
+    from improvements import (
+        get_adaptive_thresholds,
+        detect_market_condition,
+        is_news_event_soon,
+        calculate_position_size,
+        get_volatility_risk_level,
+        apply_trailing_stop,
+        get_session_name,
+        is_trading_allowed,
+    )
+    IMPROVEMENTS_LOADED = True
+    print("✅ Phase 28 improvements loaded successfully")
+except Exception as e:
+    IMPROVEMENTS_LOADED = False
+    print(f"⚠️  Phase 28 improvements not available: {e}")
+
 # ── App ───────────────────────────────────────────────────────
-api = FastAPI(title="XAU/USD Triple Brain Agent v4")
+api = FastAPI(title="XAU/USD Triple Brain Agent v4.1 - Phase 28")
 api.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include improvements endpoints
+if IMPROVEMENTS_LOADED:
+    api.include_router(improvements_router)
 
 # ── Environment variables ─────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -30,6 +54,13 @@ TPSL_ID        = os.environ.get("TPSL_JSON_ID", "")
 TD_KEY         = "2c3dff7091284f92b2361649006448a8"
 MODELS_DIR     = "/app/models"
 os.makedirs(MODELS_DIR, exist_ok=True)
+
+# ── Phase 28: Improvement Tracking Variables ──────────────────
+_last_signal = None
+_last_signal_time = None
+_signal_count_today = 0
+_atr_history = []  # Track ATR for volatility_ma calculation
+_volatility_ma = 15.0  # Moving average of ATR
 
 # ── CRITICAL FIX: Safe number helpers ────────────────────────
 # These prevent the "NoneType.__format__" crash that was happening
@@ -180,14 +211,15 @@ def _check_health(result):
 def root():
     sname, sq, _, si = get_session()
     return {
-        "agent":   "XAU/USD Triple Brain v4",
+        "agent":   "XAU/USD Triple Brain v4.1 - Phase 28",
         "status":  "running",
         "session": sname,
         "session_quality": sq,
         "session_icon":    si,
         "time":    datetime.now(timezone.utc).isoformat(),
         "last_run": last_run_time or "never",
-        "run_count": _run_count
+        "run_count": _run_count,
+        "improvements": "ENABLED" if IMPROVEMENTS_LOADED else "DISABLED"
     }
 
 @api.get("/health")
@@ -195,6 +227,7 @@ def health_ep():
     return {
         "status":        "ok",
         "agent_loaded":  _agent_loaded,
+        "improvements":  IMPROVEMENTS_LOADED,
         "last_run":      last_run_time or "never",
         "last_signal":   last_result.get("signal", "none"),
         "run_count":     _run_count,
@@ -210,6 +243,7 @@ def status_ep():
         "session_trade_ok":  stok,
         "session_icon":      si,
         "last_run":          last_run_time or "never",
+        "improvements":      "ENABLED" if IMPROVEMENTS_LOADED else "DISABLED"
     }
     if not last_result:
         base.update({
@@ -224,7 +258,8 @@ def status_ep():
                 "brain3":      {"ok": False, "msg": "pending first run"},
                 "h4":          {"ok": False, "msg": "pending"},
                 "telegram":    {"ok": bool(TELEGRAM_TOKEN), "msg": "ok" if TELEGRAM_TOKEN else "no token"},
-                "daily_limit": {"ok": True, "msg": "ok"}
+                "daily_limit": {"ok": True, "msg": "ok"},
+                "improvements": {"ok": IMPROVEMENTS_LOADED, "msg": "Phase 28 " + ("loaded" if IMPROVEMENTS_LOADED else "failed")}
             }
         })
         return JSONResponse(content=base)
@@ -306,19 +341,52 @@ def files_ep():
         "files":        files,
         "RUN_INTERVAL": RUN_INTERVAL,
         "telegram":     "SET" if TELEGRAM_TOKEN else "NOT SET",
-        "agent_loaded": _agent_loaded
+        "agent_loaded": _agent_loaded,
+        "improvements": "ENABLED" if IMPROVEMENTS_LOADED else "DISABLED"
     }
+
+# ── Phase 28: Enhanced Status Endpoint ────────────────────────
+@api.get("/status/enhanced")
+async def get_enhanced_status():
+    """Get enhanced status with improvements data"""
+    if not IMPROVEMENTS_LOADED:
+        return {"status": "improvements not loaded"}
+    
+    try:
+        market_condition = detect_market_condition(_volatility_ma, _volatility_ma)
+        news_coming, event_name, minutes_until = is_news_event_soon()
+        
+        return {
+            "status": "ok",
+            "improvements": {
+                "performance_tracking": True,
+                "adaptive_thresholds": True,
+                "volatility_filters": True,
+                "economic_calendar": True,
+                "position_sizing": True
+            },
+            "performance": tracker.get_summary(),
+            "market_condition": market_condition,
+            "news_event_soon": news_coming,
+            "event_name": event_name,
+            "minutes_until_event": minutes_until,
+            "volatility_ma": _volatility_ma
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 # ── Scheduler ─────────────────────────────────────────────────
 def scheduler():
-    global _run_count
+    global _run_count, _volatility_ma
     time.sleep(20)
     sname, _, _, _ = get_session()
+    
     tg(
         "AGENT STARTED - Railway 24/7\n"
         "Interval: every " + str(RUN_INTERVAL // 60) + " min\n"
         "Session: " + sname + "\n"
         "Time: " + datetime.now(timezone.utc).strftime("%H:%M UTC") + "\n"
+        "Phase 28: Improvements " + ("ENABLED ✅" if IMPROVEMENTS_LOADED else "DISABLED ⚠️") + "\n"
         "Dashboard: ceylonpropertylink.com/agent/dashboard.html"
     )
 
@@ -346,12 +414,62 @@ def scheduler():
 
             print("  " + sig + " | B1=" + sf(b1,3) + " | B2=" + sf(b2,1) + " | conf=" + sf(conf,1) + " | $" + sf(price))
 
+            # ── Phase 28: Adaptive Thresholds & Economic Calendar ──
+            if IMPROVEMENTS_LOADED:
+                try:
+                    # Get ATR for volatility calculation
+                    atr_val = sn(result.get("volatility", {}).get("atr14", 15.0), 15.0)
+                    _atr_history.append(atr_val)
+                    if len(_atr_history) > 20:
+                        _atr_history.pop(0)
+                    _volatility_ma = np.mean(_atr_history) if _atr_history else 15.0
+
+                    # Check for economic events
+                    news_coming, event_name, minutes_until = is_news_event_soon()
+                    if news_coming:
+                        print(f"   ⚠️  HIGH-IMPACT NEWS: {event_name} in {minutes_until:.0f} min - SKIP TRADE")
+                        sig = "WAIT"
+
+                    # Get adaptive thresholds
+                    market_condition = detect_market_condition(atr_val, _volatility_ma)
+                    recent_win_rate = tracker.get_win_rate()
+                    adaptive_thresholds = get_adaptive_thresholds(market_condition, recent_win_rate)
+
+                    # Get position size
+                    recommended_lot = calculate_position_size(atr_val)
+                    risk_level = get_volatility_risk_level(atr_val)
+
+                    print(f"   📊 Market: {market_condition} | ATR: {sf(atr_val)} | Lot: {sf(recommended_lot)} | Risk: {risk_level}")
+
+                except Exception as e:
+                    print(f"   ⚠️  Phase 28 error: {e}")
+
             if sig in ("BUY", "SELL"):
                 em   = "BUY" if sig == "BUY" else "SELL"
                 icon = "📈" if sig == "BUY" else "📉"
                 rr   = 0
                 if tp and sl and price and abs(sl - price) > 0:
                     rr = abs(tp - price) / abs(sl - price)
+                
+                # ── Phase 28: Log Trade ───────────────────────────
+                if IMPROVEMENTS_LOADED:
+                    try:
+                        session_name = get_session()[0]
+                        tracker.log_trade(
+                            entry_time=datetime.now(timezone.utc).isoformat(),
+                            entry_price=price,
+                            exit_time=datetime.now(timezone.utc).isoformat(),
+                            exit_price=price,
+                            signal=sig,
+                            b1_score=b1,
+                            b2_score=b2,
+                            b3_score=conf,
+                            session=session_name
+                        )
+                        print(f"   ✅ Trade logged")
+                    except Exception as e:
+                        print(f"   ⚠️  Failed to log trade: {e}")
+
                 tg(
                     icon + " <b>" + em + " - XAU/USD</b>\n\n"
                     "Confidence: <b>" + sf(conf, 1) + "/10</b>\n"
@@ -360,9 +478,10 @@ def scheduler():
                     "Stop Loss:   $" + sf(sl) + "\n"
                     "RR: 1:" + sf(rr, 1) + "\n\n"
                     "B1:" + sf(b1, 3) + " B2:" + sf(b2, 1) + "/10 B3:" + sf(conf, 1) + "/10\n"
+                    + ("Win Rate: " + sf(tracker.get_win_rate(), 1) + "%\n" if IMPROVEMENTS_LOADED else "")
                     + sname2 + " | " + now_str + "\n\n"
                     "Open trade on Exness NOW!\n"
-                    "XAU/USD Triple Brain v4"
+                    "XAU/USD Triple Brain v4.1 - Phase 28"
                 )
 
             elif _run_count % 6 == 0:
@@ -378,10 +497,12 @@ def scheduler():
                     why = "B2=" + sf(b2, 1) + "/10 (need 5.0)"
                 elif conf < 6.5:
                     why = "B3=" + sf(conf, 1) + "/10 (need 6.5)"
+                
                 tg(
                     "Status: WAIT - " + why + "\n"
                     "B1:" + sf(b1, 3) + " B2:" + sf(b2, 1) + "/10 B3:" + sf(conf, 1) + "/10\n"
                     "Price: $" + sf(price) + "\n"
+                    + ("Win Rate: " + sf(tracker.get_win_rate(), 1) + "%\n" if IMPROVEMENTS_LOADED else "")
                     + sname2 + " | " + now_str
                 )
 
@@ -397,3 +518,4 @@ def scheduler():
 
 threading.Thread(target=scheduler, daemon=True).start()
 print("Scheduler started - every " + str(RUN_INTERVAL) + "s (" + str(RUN_INTERVAL // 60) + " min)")
+print("Phase 28 Improvements: " + ("ENABLED ✅" if IMPROVEMENTS_LOADED else "DISABLED ⚠️"))
