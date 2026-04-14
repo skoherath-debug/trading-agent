@@ -51,7 +51,7 @@ RUN_INTERVAL   = int(os.environ.get("RUN_INTERVAL", "300"))
 PKL_ID         = os.environ.get("MODEL_PKL_ID", "")
 JSON_ID        = os.environ.get("MODEL_JSON_ID", "")
 TPSL_ID        = os.environ.get("TPSL_JSON_ID", "")
-TD_KEY         = "2c3dff7091284f92b2361649006448a8"
+TD_KEY         = os.environ.get("TD_KEY", "")          # ← set in Railway env vars
 MODELS_DIR     = "/app/models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -218,6 +218,20 @@ last_run_time = ""
 _prev_health  = {}
 _run_count    = 0
 
+# ── Smart interval: 2 min trading hours, 30 min off-hours ─────
+# Trading hours = 07:00–18:00 UTC (12:30–23:30 Sri Lanka, UTC+5:30)
+# 11hr × 2min = 330 runs + 330 chart = ~660 credits/day ✅
+def get_run_interval():
+    t = datetime.now(timezone.utc)
+    mins = t.hour * 60 + t.minute
+    if 420 <= mins < 1080:   # 07:00–18:00 UTC
+        return 120           # 2 min — maximum accuracy during trading
+    return 1800              # 30 min — keepalive only outside trading hours
+
+# ── Chart cache (visual only — no accuracy impact) ────────────
+_chart_cache      = {"bars": [], "ts": 0.0}
+CHART_CACHE_TTL   = 120   # 2 min cache (matches scheduler interval)
+
 def _save_result(result):
     global last_result, last_run_time
     last_result   = result
@@ -318,6 +332,12 @@ def run_ep():
 
 @api.get("/chart-data")
 def chart_ep():
+    global _chart_cache
+    # Serve from cache if fresh (3 min TTL — chart is visual only, no accuracy impact)
+    if _chart_cache["bars"] and (time.time() - _chart_cache["ts"]) < CHART_CACHE_TTL:
+        return JSONResponse(content={
+            "bars": _chart_cache["bars"], "symbol": "XAU/USD", "tf": "15m", "cached": True
+        })
     try:
         r = req.get(
             "https://api.twelvedata.com/time_series",
@@ -346,8 +366,16 @@ def chart_ep():
                 })
             except Exception:
                 pass
+        # Update cache
+        _chart_cache["bars"] = bars
+        _chart_cache["ts"]   = time.time()
         return JSONResponse(content={"bars": bars, "symbol": "XAU/USD", "tf": "15m"})
     except Exception as e:
+        # Return stale cache if available, else empty
+        if _chart_cache["bars"]:
+            return JSONResponse(content={
+                "bars": _chart_cache["bars"], "symbol": "XAU/USD", "tf": "15m", "cached": True, "stale": True
+            })
         return JSONResponse(content={"error": str(e), "bars": []}, status_code=500)
 
 @api.post("/telegram/send")
@@ -412,7 +440,7 @@ def scheduler():
     
     tg(
         "AGENT STARTED - Railway 24/7\n"
-        "Interval: every " + str(RUN_INTERVAL // 60) + " min\n"
+        "Interval: 2 min trading (07:00-18:00 UTC) / 30 min off-hours\n"
         "Session: " + sname + "\n"
         "Time: " + datetime.now(timezone.utc).strftime("%H:%M UTC") + "\n"
         "Phase 28: Improvements " + ("ENABLED ✅" if IMPROVEMENTS_LOADED else "DISABLED ⚠️") + "\n"
@@ -542,9 +570,9 @@ def scheduler():
             print(tb[:400])
             tg("Analysis error: " + short + "\n" + now_str + "\nCheck Railway logs.")
 
-        time.sleep(RUN_INTERVAL)
+        time.sleep(get_run_interval())
 
 
 threading.Thread(target=scheduler, daemon=True).start()
-print("Scheduler started - every " + str(RUN_INTERVAL) + "s (" + str(RUN_INTERVAL // 60) + " min)")
+print("Scheduler started - 2 min trading (07:00-18:00 UTC) / 30 min off-hours")
 print("Phase 28 Improvements: " + ("ENABLED ✅" if IMPROVEMENTS_LOADED else "DISABLED ⚠️"))
