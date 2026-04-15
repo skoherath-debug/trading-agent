@@ -4,7 +4,14 @@ from datetime import datetime, timezone, time as _time
 # ── Env vars ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8172828888:AAFWCvtCl1F-Kj5yOv_EFEB9vxL-ir-dD9I")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT",  "7132630179")
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY",   "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")
+# ── Groq API key rotation ─────────────────────────────────────────────────────
+_GROQ_KEYS = [k for k in [
+    os.environ.get("GROQ_API_KEY",  "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"),
+    os.environ.get("GROQ_API_KEY2", "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"),
+    os.environ.get("GROQ_API_KEY3", "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"),
+] if k.strip()]
+_groq_key_index = 0
+GROQ_API_KEY = _GROQ_KEYS[0]  # legacy compat
 # ── Twelve Data key rotation (add TD_KEY, TD_KEY2, TD_KEY3 in Railway) ──────
 _TD_KEYS = [k for k in [
     os.environ.get("TD_KEY",  "f3883b7831a540cda02cfafcfe77e082"),
@@ -27,7 +34,16 @@ def rotate_td_key(reason=""):
     print(f"[TD KEY] Rotated to key {(_td_key_index % len(_TD_KEYS)) + 1}/{len(_TD_KEYS)} — {reason}")
 
 TD_KEY = get_td_key()  # legacy compat
-GROQ_MODEL     = "llama-3.3-70b-versatile"
+# ── Groq model rotation (rotates on rate limit) ──────────────────────────────
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",   # primary   — 100k TPD
+    "llama3-70b-8192",            # fallback1 — separate limit
+    "gemma2-9b-it",               # fallback2 — Google model on Groq
+    "llama3-8b-8192",             # fallback3 — fast, low token usage
+    "mixtral-8x7b-32768",         # fallback4 — Mistral
+]
+_groq_model_index = 0
+GROQ_MODEL = GROQ_MODELS[0]  # legacy compat
 SYMBOL         = "GC=F"
 
 # ── numpy → pure Python converter ────────────────────────────────────────────
@@ -721,20 +737,37 @@ def run_analysis():
         f"S/R gap: ${sr_gap:.2f}{sr_flip_note}{tight_note}\n\n"
         f"Give 5-line trading briefing. Be specific about WHY signal is {sig}."
     )
-    try:
-        import requests as req
-        resp  = req.post("https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization":f"Bearer {GROQ_API_KEY}","Content-Type":"application/json"},
-            json={"model":GROQ_MODEL,"max_tokens":300,
-                  "messages":[{"role":"user","content":prompt}]},timeout=15)
-        data  = resp.json()
-        if "choices" not in data:
-            raise ValueError(data.get("error",{}).get("message",str(data)))
-        b3_text = data["choices"][0]["message"]["content"]
-        health["brain3"] = {"ok":True,"msg":f"model={GROQ_MODEL}"}
-    except Exception as e:
-        b3_text = f"Brain 3 unavailable: {e}"
-        health["brain3"] = {"ok":False,"msg":f"Groq error: {e}"}
+    import requests as req
+    b3_text = None
+    global _groq_model_index, _groq_key_index
+    # Try every key × every model combination until one works
+    _total_attempts = len(_GROQ_KEYS) * len(GROQ_MODELS)
+    for _attempt in range(_total_attempts):
+        _key   = _GROQ_KEYS[_groq_key_index % len(_GROQ_KEYS)]
+        _model = GROQ_MODELS[_groq_model_index % len(GROQ_MODELS)]
+        try:
+            resp = req.post("https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization":f"Bearer {_key}","Content-Type":"application/json"},
+                json={"model":_model,"max_tokens":150,
+                      "messages":[{"role":"user","content":prompt}]},timeout=15)
+            data = resp.json()
+            err_msg = data.get("error",{}).get("message","") if "error" in data else ""
+            if "rate_limit" in err_msg.lower() or "limit" in err_msg.lower() or "choices" not in data:
+                print(f"[B3] key{_groq_key_index+1}/{_model} limited — rotating key")
+                _groq_key_index  += 1
+                if _groq_key_index % len(_GROQ_KEYS) == 0:
+                    _groq_model_index += 1   # all keys exhausted on this model → try next model
+                continue
+            b3_text = data["choices"][0]["message"]["content"]
+            health["brain3"] = {"ok":True,"msg":f"model={_model} key={_groq_key_index%len(_GROQ_KEYS)+1}/{len(_GROQ_KEYS)}"}
+            break
+        except Exception as e:
+            print(f"[B3] {_model} error: {e}")
+            _groq_key_index += 1
+    if not b3_text:
+        b3_text = (f"B3 unavailable — all {len(_GROQ_KEYS)} keys × {len(GROQ_MODELS)} models at limit. "
+                   f"B1={round(b1_buy,3)} B2={b2_score}. Signal based on B1+B2 only.")
+        health["brain3"] = {"ok":False,"msg":f"All {len(_GROQ_KEYS)} Groq keys rate limited"}
 
     # ── Phase 29 Improvement 3: S/R flip Telegram alert ──────────────────────
     check_sr_flip(price, support, resistance, atr)
