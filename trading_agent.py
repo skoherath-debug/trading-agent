@@ -598,9 +598,31 @@ def run_analysis():
 
     # ── Signal fusion ────────────────────────────────────────────────────────
     fused = (b1_score*0.4) + (b2_score*0.6)
-    if b1_dir==b2_sig and b1_dir!="WAIT": fused += 0.5
-    if fused>=6.5: sig,conf = "BUY","HIGH" if fused>=8 else "MEDIUM"
-    elif fused<=3.5: sig,conf = "SELL","HIGH" if fused<=2 else "MEDIUM"
+
+    # ── Fix: normalise B2 signal (BULLISH→BUY, BEARISH→SELL) ────────────────
+    b2_dir = "BUY"  if any(x in b2_sig.upper() for x in ["BUY","BULL"]) else              "SELL" if any(x in b2_sig.upper() for x in ["SELL","BEAR"]) else "WAIT"
+
+    # ── Alignment bonus: B1 + B2 agree ──────────────────────────────────────
+    if b1_dir == b2_dir and b1_dir != "WAIT":
+        fused += 0.5
+        print(f"   ✅ B1+B2 aligned ({b1_dir}) → fused +0.5")
+
+    # ── H4 directional bonus ─────────────────────────────────────────────────
+    # Applied BEFORE H4 veto so aligned H4 boosts signal
+    try:
+        _h4_pre = _get_h4_trend(df)
+        _h4_dir = _h4_pre.get("direction","NEUTRAL")
+        if _h4_dir == "BUY"  and b1_dir == "BUY"  and fused > 5.0:
+            fused += 0.4
+            print(f"   📈 H4 BUY aligned → fused +0.4")
+        elif _h4_dir == "SELL" and b1_dir == "SELL" and fused < 5.0:
+            fused -= 0.4
+            print(f"   📉 H4 SELL aligned → fused -0.4")
+    except Exception:
+        pass
+
+    if fused>=6.3: sig,conf = "BUY","HIGH" if fused>=8 else "MEDIUM"
+    elif fused<=3.7: sig,conf = "SELL","HIGH" if fused<=2 else "MEDIUM"
     else: sig,conf = "WAIT","LOW"
 
     price   = round(float(df_live["close"].iloc[-1]), 2)
