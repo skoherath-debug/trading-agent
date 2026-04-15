@@ -5,7 +5,28 @@ from datetime import datetime, timezone, time as _time
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8172828888:AAFWCvtCl1F-Kj5yOv_EFEB9vxL-ir-dD9I")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT",  "7132630179")
 GROQ_API_KEY   = os.environ.get("GROQ_API_KEY",   "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")
-TD_KEY         = os.environ.get("TD_KEY",          "")
+# ── Twelve Data key rotation (add TD_KEY, TD_KEY2, TD_KEY3 in Railway) ──────
+_TD_KEYS = [k for k in [
+    os.environ.get("TD_KEY",  "f3883b7831a540cda02cfafcfe77e082"),
+    os.environ.get("TD_KEY2", "41c8cfdf490b4bf4a0d388e716a32453"),
+    os.environ.get("TD_KEY3", "f58b0a482f1443e78fb23cf8975b44d9"),
+] if k.strip()]
+_td_key_index = 0
+
+def get_td_key():
+    """Return current active TD key."""
+    global _td_key_index
+    if not _TD_KEYS: return ""
+    return _TD_KEYS[_td_key_index % len(_TD_KEYS)]
+
+def rotate_td_key(reason=""):
+    """Switch to next TD key (call when rate limit hit)."""
+    global _td_key_index
+    if len(_TD_KEYS) <= 1: return
+    _td_key_index += 1
+    print(f"[TD KEY] Rotated to key {(_td_key_index % len(_TD_KEYS)) + 1}/{len(_TD_KEYS)} — {reason}")
+
+TD_KEY = get_td_key()  # legacy compat
 GROQ_MODEL     = "llama-3.3-70b-versatile"
 SYMBOL         = "GC=F"
 
@@ -487,14 +508,24 @@ def run_analysis():
     # ── Data feed ────────────────────────────────────────────────────────────
     try:
         _td_df = None
-        if TD_KEY:
+        if _TD_KEYS:
             try:
                 import requests as _req
+                _active_key = get_td_key()
                 _r = _req.get("https://api.twelvedata.com/time_series", params={
                     "symbol":"XAU/USD","interval":"1h","outputsize":500,
-                    "apikey":TD_KEY,"timezone":"UTC","format":"JSON"
+                    "apikey":_active_key,"timezone":"UTC","format":"JSON"
                 }, timeout=30)
                 _td = _r.json()
+                # Detect rate limit / exhausted key → rotate
+                if "code" in _td and _td.get("code") in [429, 400, 403]:
+                    rotate_td_key(f"API error code {_td.get('code')}: {_td.get('message','')}")
+                    _active_key = get_td_key()
+                    _r2 = _req.get("https://api.twelvedata.com/time_series", params={
+                        "symbol":"XAU/USD","interval":"1h","outputsize":500,
+                        "apikey":_active_key,"timezone":"UTC","format":"JSON"
+                    }, timeout=30)
+                    _td = _r2.json()
                 if "values" in _td:
                     _td_df = pd.DataFrame(_td["values"])
                     _td_df["datetime"] = pd.to_datetime(_td_df["datetime"])
