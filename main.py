@@ -546,11 +546,14 @@ def scheduler():
             dir_changed  = sig != _last_alerted_sig   # BUY→SELL always fires
             price_moved  = abs(price - _last_alerted_price) > 8.0
 
-            # Only alert during quality sessions (not low-volume Asian)
+            # Quality gates for alert
             session_quality_ok = sq2 in ("HIGH", "MEDIUM")
+            rocket_score    = sn((result.get("brain2") or {}).get("details", {}).get("rocket_score"), 0)
+            waterfall_score = sn((result.get("brain2") or {}).get("details", {}).get("waterfall_score"), 0)
+            momentum_ok = (sig == "BUY"  and rocket_score    >= 50) or                           (sig == "SELL" and waterfall_score >= 50)
 
-            # Fire if: cooldown passed AND good session OR direction flipped
-            should_alert = (cooldown_ok and session_quality_ok) or dir_changed
+            # Fire if: cooldown ok AND session ok AND momentum confirmed OR direction flipped
+            should_alert = (cooldown_ok and session_quality_ok and momentum_ok) or dir_changed
 
             if sig in ("BUY", "SELL") and should_alert:
                 _last_alerted_sig   = sig
@@ -597,6 +600,7 @@ def scheduler():
                     "━━━━━━━━━━━━━━━━━━━━\n"
                     "Score: " + sf(conf,2) + "/10  RR: 1:" + sf(rr,1) + "\n"
                     "B1: " + sf(b1,3) + "  B2: " + sf(b2,1) + "/10  H4: " + h4d + "\n"
+                    + ("🚀 Rocket: " + str(int(rocket_score)) + "/100\n" if sig=="BUY" else "💧 Waterfall: " + str(int(waterfall_score)) + "/100\n")
                     "WR: 80.3%  Lot: 0.03\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
                     + sname2 + " | " + now_str + "\n"
