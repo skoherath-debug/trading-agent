@@ -588,23 +588,23 @@ def scheduler():
                     entry_guide = "Entry: $" + sf(price)
                     q_emoji = "🟡"
 
+                mom_line = ("🚀 Rocket: " + str(int(rocket_score)) + "/100\n") if sig=="BUY" else ("💧 Waterfall: " + str(int(waterfall_score)) + "/100\n")
                 tg(
                     icon + " " + sig + " XAU/USD\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    "Entry Quality: " + q_emoji + " " + (sf(ea["quality"],0)+"/10" if ea else "—") + "\n"
+                    + "━━━━━━━━━━━━━━━━━━━━\n"
+                    + "Entry: $" + sf(price) + "  Quality: " + q_emoji + " " + (sf(ea["quality"],0)+"/10" if ea else "—") + "\n"
                     + entry_guide + "\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    "TP1 : $" + sf(tp)  + "  (+" + sf(abs(tp -price)) + ")\n"
-                    "TP2 : $" + sf(tp2) + "  (+" + sf(abs(tp2-price)) + ")\n"
-                    "SL  : $" + sf(sl)  + "  (-" + sf(abs(sl -price)) + ")\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    "Score: " + sf(conf,2) + "/10  RR: 1:" + sf(rr,1) + "\n"
-                    "B1: " + sf(b1,3) + "  B2: " + sf(b2,1) + "/10  H4: " + h4d + "\n"
-                    + ("🚀 Rocket: " + str(int(rocket_score)) + "/100\n" if sig=="BUY" else "💧 Waterfall: " + str(int(waterfall_score)) + "/100\n")
-                    "WR: 80.3%  Lot: 0.03\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    + "━━━━━━━━━━━━━━━━━━━━\n"
+                    + "TP1: $" + sf(tp)  + " (+" + sf(abs(tp -price)) + ")  TP2: $" + sf(tp2) + "\n"
+                    + "SL:  $" + sf(sl)  + " (-" + sf(abs(sl -price)) + ")\n"
+                    + "━━━━━━━━━━━━━━━━━━━━\n"
+                    + "Score: " + sf(conf,2) + "/10  RR: 1:" + sf(rr,1) + "\n"
+                    + "B1: " + sf(b1,3) + "  B2: " + sf(b2,1) + "/10  H4: " + h4d + "\n"
+                    + mom_line
+                    + "WR: 80.3%  Lot: 0.03\n"
+                    + "━━━━━━━━━━━━━━━━━━━━\n"
                     + sname2 + " | " + now_str + "\n"
-                    "agent.ceylonpropertylink.com"
+                    + "agent.ceylonpropertylink.com"
                 )
 
             # Reset tracker when WAIT — allows fresh signal next time
@@ -613,8 +613,8 @@ def scheduler():
                 _last_alerted_price = 0.0
                 # Don't reset _last_alerted_time — cooldown still applies
 
-            # ── SL / TP price alerts — bypass cooldown completely ─────────
-            # These protect the trader regardless of signal state
+
+            # ── SL / TP price alerts ─────────────────────────────────────────
             _tp1  = sn(last_result.get("tp"),  0)
             _tp2  = sn(last_result.get("tp2"), 0)
             _sl   = sn(last_result.get("sl"),  0)
@@ -622,145 +622,29 @@ def scheduler():
 
             if _last_alerted_sig == "BUY" and _sl > 0 and price > 0:
                 dist_to_sl = price - _sl
-                dist_to_tp1 = _tp1 - price if _tp1 > 0 else 999
-
-                # SL breach warning — price within 30% of SL distance
                 if 0 < dist_to_sl < _atr * 0.3:
-                    tg(
-                        "⚠️ SL WARNING — BUY TRADE
-"
-                        "━━━━━━━━━━━━━━━━━━━━
-"
-                        "Price : $" + sf(price) + "
-"
-                        "SL    : $" + sf(_sl) + "  (" + sf(dist_to_sl) + " away)
-"
-                        "━━━━━━━━━━━━━━━━━━━━
-"
-                        "Consider closing to protect capital!
-"
-                        "agent.ceylonpropertylink.com"
-                    )
-                    print("   🚨 SL WARNING sent")
-
-                # SL breached — price went below SL
+                    tg("⚠️ SL WARNING BUY\nPrice: $" + sf(price) + "\nSL: $" + sf(_sl) + " (" + sf(dist_to_sl) + " away)\nConsider closing!\nagent.ceylonpropertylink.com")
+                    print("SL WARNING sent")
                 elif price < _sl:
-                    tg(
-                        "🛑 SL BREACHED — BUY TRADE
-"
-                        "━━━━━━━━━━━━━━━━━━━━
-"
-                        "Price : $" + sf(price) + "
-"
-                        "SL    : $" + sf(_sl) + "
-"
-                        "Loss  : ~$" + sf(abs(price - _sl) * 3) + "
-"
-                        "━━━━━━━━━━━━━━━━━━━━
-"
-                        "CLOSE TRADE NOW on Exness!
-"
-                        "agent.ceylonpropertylink.com"
-                    )
-                    print("   🛑 SL BREACH alert sent")
-                    _last_alerted_sig = "WAIT"  # reset after SL hit
-
-                # TP1 hit
+                    tg("🛑 SL BREACHED BUY\nPrice: $" + sf(price) + "\nSL: $" + sf(_sl) + "\nLoss: ~$" + sf(abs(price-_sl)*3) + "\nCLOSE NOW on Exness!\nagent.ceylonpropertylink.com")
+                    print("SL BREACH sent")
+                    _last_alerted_sig = "WAIT"
                 elif _tp1 > 0 and price >= _tp1:
-                    tg(
-                        "🎯 TP1 HIT — BUY TRADE
-"
-                        "━━━━━━━━━━━━━━━━━━━━
-"
-                        "Price : $" + sf(price) + "
-"
-                        "TP1   : $" + sf(_tp1) + "
-"
-                        "Profit: ~$" + sf(abs(price - _last_alerted_price) * 3) + "
-"
-                        "━━━━━━━━━━━━━━━━━━━━
-"
-                        "Move SL to breakeven. Watch for TP2: $" + sf(_tp2) + "
-"
-                        "agent.ceylonpropertylink.com"
-                    )
-                    print("   🎯 TP1 alert sent")
+                    tg("🎯 TP1 HIT BUY\nPrice: $" + sf(price) + "\nTP1: $" + sf(_tp1) + "\nProfit: ~$" + sf(abs(price-_last_alerted_price)*3) + "\nMove SL to breakeven. TP2: $" + sf(_tp2) + "\nagent.ceylonpropertylink.com")
+                    print("TP1 HIT sent")
 
             elif _last_alerted_sig == "SELL" and _sl > 0 and price > 0:
                 dist_to_sl = _sl - price
-
                 if 0 < dist_to_sl < _atr * 0.3:
-                    tg(
-                        "⚠️ SL WARNING — SELL TRADE
-"
-                        "━━━━━━━━━━━━━━━━━━━━
-"
-                        "Price : $" + sf(price) + "
-"
-                        "SL    : $" + sf(_sl) + "  (" + sf(dist_to_sl) + " away)
-"
-                        "━━━━━━━━━━━━━━━━━━━━
-"
-                        "Consider closing to protect capital!
-"
-                        "agent.ceylonpropertylink.com"
-                    )
-                    print("   🚨 SL WARNING sent")
-
+                    tg("⚠️ SL WARNING SELL\nPrice: $" + sf(price) + "\nSL: $" + sf(_sl) + " (" + sf(dist_to_sl) + " away)\nConsider closing!\nagent.ceylonpropertylink.com")
+                    print("SL WARNING sent")
                 elif price > _sl:
-                    tg(
-                        "🛑 SL BREACHED — SELL TRADE
-"
-                        "━━━━━━━━━━━━━━━━━━━━
-"
-                        "Price : $" + sf(price) + "
-"
-                        "SL    : $" + sf(_sl) + "
-"
-                        "Loss  : ~$" + sf(abs(price - _sl) * 3) + "
-"
-                        "━━━━━━━━━━━━━━━━━━━━
-"
-                        "CLOSE TRADE NOW on Exness!
-"
-                        "agent.ceylonpropertylink.com"
-                    )
-                    print("   🛑 SL BREACH alert sent")
+                    tg("🛑 SL BREACHED SELL\nPrice: $" + sf(price) + "\nSL: $" + sf(_sl) + "\nLoss: ~$" + sf(abs(price-_sl)*3) + "\nCLOSE NOW on Exness!\nagent.ceylonpropertylink.com")
+                    print("SL BREACH sent")
                     _last_alerted_sig = "WAIT"
-
                 elif _tp1 > 0 and price <= _tp1:
-                    tg(
-                        "🎯 TP1 HIT — SELL TRADE
-"
-                        "━━━━━━━━━━━━━━━━━━━━
-"
-                        "Price : $" + sf(price) + "
-"
-                        "TP1   : $" + sf(_tp1) + "
-"
-                        "Profit: ~$" + sf(abs(_last_alerted_price - price) * 3) + "
-"
-                        "━━━━━━━━━━━━━━━━━━━━
-"
-                        "Move SL to breakeven. Watch for TP2: $" + sf(_tp2) + "
-"
-                        "agent.ceylonpropertylink.com"
-                    )
-                    print("   🎯 TP1 alert sent")
-
-            # ── Periodic WAIT status (every 30 min) ──────────────
-            elif _run_count % 15 == 0:
-                why = ("session blocked" if sb else
-                       "H4 veto" if h4v else
-                       "B1=" + sf(b1,3) + " needs 0.600" if b1 < 0.60 else
-                       "B2=" + sf(b2,1) + " needs 5.0"   if b2 < 5.0  else
-                       "conf=" + sf(conf,1) + " needs 6.5")
-                tg(
-                    "⏳ WAIT | $" + sf(price) + "\n"
-                    "Reason: " + why + "\n"
-                    "B1: " + sf(b1,3) + "  B2: " + sf(b2,1) + "/10\n"
-                    + sname2 + " | " + now_str
-                )
+                    tg("🎯 TP1 HIT SELL\nPrice: $" + sf(price) + "\nTP1: $" + sf(_tp1) + "\nProfit: ~$" + sf(abs(_last_alerted_price-price)*3) + "\nMove SL to breakeven. TP2: $" + sf(_tp2) + "\nagent.ceylonpropertylink.com")
+                    print("TP1 HIT sent")
 
         except Exception as e:
             short = str(e)[:200]
