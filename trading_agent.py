@@ -481,10 +481,37 @@ def run_analysis():
     print(f"\n🕐 Session: {now_utc} | Quality: {session_quality}")
 
     if not trade_allowed:
-        return {"signal":"WAIT","confidence":0,"price":None,
-                "session_blocked":True,"session_quality":session_quality,
-                "session_trade_ok":False,"session_icon":"🔴",
-                "timestamp":datetime.now(timezone.utc).isoformat()}
+        # OFF-HOURS: fetch only live price (1 TD call), skip Groq + analysis entirely
+        _price = None
+        try:
+            import requests as _rq
+            _k = get_td_key()
+            _r = _rq.get("https://api.twelvedata.com/price",
+                params={"symbol":"XAU/USD","apikey":_k}, timeout=10)
+            _price = float(_r.json().get("price", 0)) or None
+        except Exception:
+            pass
+        return _to_python({
+            "signal":          "WAIT",
+            "confidence":      0,
+            "price":           _price,
+            "session_blocked": True,
+            "session_quality": session_quality,
+            "session_trade_ok":False,
+            "session_icon":    "🔴",
+            "daily_pnl":       _load_daily_pnl()["total_pnl"],
+            "trade_count":     _load_daily_pnl()["trade_count"],
+            "health": {
+                "data_feed":   {"ok":True,  "msg":"Off-hours — price only"},
+                "brain1":      {"ok":True,  "msg":"Standby until 07:00 UTC"},
+                "brain2":      {"ok":True,  "msg":"Standby until 07:00 UTC"},
+                "brain3":      {"ok":True,  "msg":"Standby until 07:00 UTC"},
+                "h4":          {"ok":True,  "msg":"Standby until 07:00 UTC"},
+                "telegram":    {"ok":True,  "msg":"standby"},
+                "daily_limit": {"ok":True,  "msg":"OK"},
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
 
     # ── Daily loss limit ─────────────────────────────────────────────────────
     day_blocked, day_reason, day_pnl = _check_daily_limit()
