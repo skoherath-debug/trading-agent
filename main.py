@@ -73,6 +73,79 @@ def sn(v, fallback=0):
         return fallback if f != f else f
     except Exception: return fallback
 
+# ── Expert Entry Analysis ────────────────────────────────────
+def get_entry_analysis(result, current_price):
+    """
+    Professional entry point analysis:
+    1. Entry zone check — is current price still in valid zone?
+    2. Limit order recommendation
+    3. Confirmation level
+    4. Entry quality score
+    """
+    sig    = result.get("signal","WAIT")
+    sig_px = sn(result.get("price"), 0)
+    atr    = sn(result.get("atr"), 13)
+    tp1    = sn(result.get("tp"),  0)
+    sl     = sn(result.get("sl"),  0)
+    h4     = result.get("h4") or {}
+    ema20  = sn(h4.get("ema20"), 0)
+
+    if sig not in ("BUY","SELL") or sig_px == 0:
+        return None
+
+    # Entry zone: signal price ± 0.4 ATR
+    zone_size   = round(atr * 0.4, 2)
+    zone_low    = round(sig_px - zone_size, 2)
+    zone_high   = round(sig_px + zone_size, 2)
+
+    # Limit order level: 0.2 ATR better than signal price
+    limit_offset = round(atr * 0.2, 2)
+    if sig == "BUY":
+        limit_price = round(sig_px - limit_offset, 2)  # buy cheaper
+        in_zone     = zone_low <= current_price <= zone_high
+        price_ok    = current_price <= sig_px + zone_size
+        confirm_lvl = round(max(sig_px, ema20) + 0.5, 2) if ema20 else sig_px
+    else:
+        limit_price = round(sig_px + limit_offset, 2)  # sell higher
+        in_zone     = zone_low <= current_price <= zone_high
+        price_ok    = current_price >= sig_px - zone_size
+        confirm_lvl = round(min(sig_px, ema20) - 0.5, 2) if ema20 else sig_px
+
+    # Slippage from signal price
+    slippage    = round(abs(current_price - sig_px), 2)
+    slippage_pct= round(slippage / atr * 100, 1)
+
+    # Entry quality score (0-10)
+    if slippage <= atr * 0.1:    quality = 10  # perfect
+    elif slippage <= atr * 0.2:  quality = 8   # excellent
+    elif slippage <= atr * 0.4:  quality = 6   # acceptable
+    elif slippage <= atr * 0.6:  quality = 4   # marginal
+    else:                         quality = 0   # skip
+
+    # Adjusted TP/SL from current price
+    rr_raw = abs(tp1-sig_px)/abs(sl-sig_px) if abs(sl-sig_px) > 0 else 0
+    adj_tp1 = round(current_price + abs(tp1-sig_px), 2) if sig=="BUY" else round(current_price - abs(tp1-sig_px), 2)
+    adj_sl  = round(current_price - abs(sl-sig_px),  2) if sig=="BUY" else round(current_price + abs(sl-sig_px),  2)
+
+    return {
+        "signal":       sig,
+        "signal_price": sig_px,
+        "current_price":current_price,
+        "slippage":     slippage,
+        "slippage_pct": slippage_pct,
+        "in_zone":      in_zone,
+        "price_ok":     price_ok,
+        "quality":      quality,
+        "zone_low":     zone_low,
+        "zone_high":    zone_high,
+        "limit_price":  limit_price,
+        "limit_offset": limit_offset,
+        "confirm_level":confirm_lvl,
+        "adj_tp1":      adj_tp1,
+        "adj_sl":       adj_sl,
+        "atr":          atr,
+    }
+
 def clean(obj):
     if isinstance(obj, dict):   return {k: clean(v) for k, v in obj.items()}
     if isinstance(obj, list):   return [clean(v) for v in obj]
@@ -167,21 +240,39 @@ def tg(msg):
 def get_session():
     t = datetime.now(timezone.utc)
     m = t.hour * 60 + t.minute
-    if 780 <= m < 1020: return "LONDON/NY OVERLAP", "HIGH",   True,  "🔥"
-    elif 480 <= m < 780: return "LONDON SESSION",   "MEDIUM", True,  "🟢"
-    elif 1020 <= m < 1320: return "NEW YORK SESSION","MEDIUM", True,  "🟡"
-    else:                 return "ASIAN/OFF-HOURS",  "LOW",    False, "🔵"
+    # Sri Lanka trading: 12:30–23:30 PM = 07:00–18:00 UTC
+    # Best window: London open 07:00–11:00 UTC + NY overlap 13:00–17:00 UTC
+    if 780 <= m < 1020: return "LONDON/NY OVERLAP", "HIGH",   True,  "🔥"  # BEST
+    elif 420 <= m < 780: return "LONDON SESSION",   "HIGH",   True,  "🟢"  # GOOD
+    elif 1020 <= m < 1080: return "NEW YORK SESSION","MEDIUM", True,  "🟡"  # OK
+    else:                  return "ASIAN/OFF-HOURS", "LOW",    False, "🔵"  # SKIP
 
 # ── Smart interval ────────────────────────────────────────────
+# ── Dual-phase timing ────────────────────────────────────────
+# Phase A (2.5min): B1 + B2 pre-analysis — fast, no Groq
+# Phase B (5min):   B3 Groq confirmation — full signal decision
+PHASE_A_SECS   = 150   # 2.5 min — pre-compute B1+B2
+PHASE_B_SECS   = 300   # 5.0 min — full analysis + B3 confirm
+OFF_HOURS_SECS = 1800  # 30 min off-hours
+
 def get_run_interval():
     m = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
-    return 120 if 420 <= m < 1080 else 1800
+    return OFF_HOURS_SECS if not (420 <= m < 1080) else PHASE_A_SECS
 
 # ── Shared state ──────────────────────────────────────────────
 last_result   = {}
 last_run_time = ""
 _prev_health  = {}
 _run_count    = 0
+_last_alerted_sig   = "WAIT"   # duplicate suppression
+_pre_signal         = "WAIT"   # Phase A pre-signal
+_pre_b1             = 0.0      # Phase A B1 probability
+_pre_b2             = 0.0      # Phase A B2 score
+_pre_time           = 0.0      # Phase A timestamp
+_phase_a_count      = 0        # counts 2.5min cycles
+_last_alerted_price = 0.0
+_last_alerted_time  = 0.0      # cooldown timer
+ALERT_COOLDOWN_SECS = 1800     # 30 min — one signal per gold setup
 _price_cache  = {"price": None, "ts": 0.0}
 _chart_cache  = {"bars": [], "ts": 0.0}
 CHART_CACHE_TTL = 60
@@ -319,6 +410,21 @@ def tg_ep(body: dict):
     ok = tg(body.get("message","Test"))
     return {"ok":ok} if ok else JSONResponse(content={"ok":False,"msg":"Failed"},status_code=500)
 
+@api.get("/entry-analysis")
+def entry_analysis_ep():
+    """Real-time entry point quality analysis."""
+    if not last_result:
+        return {"error": "No signal yet"}
+    try:
+        # Get current live price
+        cur = sn(_price_cache.get("price"), sn(last_result.get("price"), 0))
+        analysis = get_entry_analysis(last_result, cur)
+        if not analysis:
+            return {"signal": "WAIT", "msg": "No active signal"}
+        return analysis
+    except Exception as e:
+        return {"error": str(e)}
+
 @api.get("/files")
 def files_ep():
     files = {}
@@ -351,6 +457,37 @@ def scheduler():
         print("[" + now_str + "] Running | " + sq2)
 
         try:
+            global _pre_signal, _pre_b1, _pre_b2, _pre_time, _phase_a_count
+            _phase_a_count += 1
+            is_phase_b = (_phase_a_count % 2 == 0)  # every 2nd cycle = 5min
+
+            # ── PHASE A (every 2.5min): B1 + B2 only ─────────────
+            if not is_phase_b:
+                print("[PHASE A] Pre-computing B1+B2...")
+                try:
+                    # Run lightweight analysis — B1+B2 only, skip B3 Groq
+                    result_a = run_analysis()
+                    _pre_b1  = sn((result_a.get("brain1") or {}).get("probability"), 0)
+                    _pre_b2  = sn((result_a.get("brain2") or {}).get("score"), 0)
+                    _pre_time= time.time()
+
+                    # Determine pre-signal direction
+                    if _pre_b1 >= 0.600 and _pre_b2 >= 5.0:
+                        _pre_signal = result_a.get("brain2",{}).get("details",{}).get("trend","WAIT")
+                        _pre_signal = "BUY" if "BULL" in _pre_signal.upper() else "WAIT"
+                    else:
+                        _pre_signal = "WAIT"
+
+                    _save_result(result_a)
+                    price_a = sn(result_a.get("price"), 0)
+                    print("  [A] B1=" + sf(_pre_b1,3) + " B2=" + sf(_pre_b2,1) + " Pre=" + _pre_signal + " $" + sf(price_a))
+                except Exception as ea:
+                    print("  [A] Pre-analysis error: " + str(ea)[:100])
+                time.sleep(PHASE_A_SECS)
+                continue  # wait for Phase B
+
+            # ── PHASE B (every 5min): Full B3 confirmation ────────
+            print("[PHASE B] Full analysis with B3 confirmation...")
             result = run_analysis()
             _run_count += 1
             _save_result(result)
@@ -369,7 +506,19 @@ def scheduler():
             h4v   = bool(result.get("h4_veto",        False))
             sb    = bool(result.get("session_blocked", False))
 
-            print("  " + sig + " | B1=" + sf(b1,3) + " | B2=" + sf(b2,1) + " | conf=" + sf(conf,1) + " | $" + sf(price))
+            # Phase B consistency check:
+            # Signal only fires if Phase A pre-signal agrees with Phase B
+            phase_consistent = (
+                (_pre_signal == sig) or           # both phases agree
+                (sig in ("BUY","SELL") and         # OR strong signal
+                 abs(time.time()-_pre_time) < 400) # within 2.5min window
+            )
+
+            if sig in ("BUY","SELL") and not phase_consistent:
+                print("  [B] SUPPRESSED — Phase A=" + _pre_signal + " Phase B=" + sig + " (inconsistent)")
+                sig = "WAIT"  # suppress inconsistent signal
+
+            print("  [B] " + sig + " | B1=" + sf(b1,3) + " B2=" + sf(b2,1) + " B3=" + b3v + " conf=" + sf(conf,1) + " $" + sf(price))
 
             # Phase 28/29 improvements
             if IMPROVEMENTS_LOADED:
@@ -390,7 +539,25 @@ def scheduler():
                     print("   Improvements error: " + str(e))
 
             # ── Send BUY/SELL alert ──────────────────────────────
-            if sig in ("BUY", "SELL"):
+            # ── Cooldown suppression — 15min between alerts ───────────
+            global _last_alerted_sig, _last_alerted_price, _last_alerted_time
+            now_ts       = time.time()
+            cooldown_ok  = (now_ts - _last_alerted_time) >= ALERT_COOLDOWN_SECS
+            dir_changed  = sig != _last_alerted_sig   # BUY→SELL always fires
+            price_moved  = abs(price - _last_alerted_price) > 8.0
+
+            # Only alert during quality sessions (not low-volume Asian)
+            session_quality_ok = sq2 in ("HIGH", "MEDIUM")
+
+            # Fire if: cooldown passed AND good session OR direction flipped
+            should_alert = (cooldown_ok and session_quality_ok) or dir_changed
+
+            if sig in ("BUY", "SELL") and should_alert:
+                _last_alerted_sig   = sig
+                _last_alerted_price = price
+                _last_alerted_time  = now_ts
+                mins_since = round((now_ts - _last_alerted_time)/60, 1) if _last_alerted_time else 0
+                print("   📱 ALERT: " + sig + " (cooldown ok, last alert " + str(mins_since) + "m ago)")
                 icon = "📈" if sig == "BUY" else "📉"
                 rr   = round(abs(tp-price)/abs(sl-price),1) if abs(sl-price) > 0 else 0
 
@@ -404,21 +571,178 @@ def scheduler():
                         )
                     except Exception: pass
 
+                # Expert entry analysis
+                ea = get_entry_analysis(result, price)
+                if ea:
+                    q_emoji = "🟢" if ea["quality"]>=8 else "🟡" if ea["quality"]>=5 else "🔴"
+                    entry_guide = (
+                        "Option A (Market): $" + sf(price) + "\n"
+                        "Option B (Limit):  $" + sf(ea["limit_price"]) + " (+" + sf(ea["limit_offset"]) + " better)\n"
+                        "Valid zone: $" + sf(ea["zone_low"]) + " — $" + sf(ea["zone_high"]) + "\n"
+                        "If price > $" + sf(ea["zone_high"]) + " → SKIP"
+                    )
+                else:
+                    entry_guide = "Entry: $" + sf(price)
+                    q_emoji = "🟡"
+
                 tg(
                     icon + " " + sig + " XAU/USD\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
-                    "Entry : $" + sf(price) + "\n"
-                    "TP1   : $" + sf(tp)  + "  (+" + sf(abs(tp -price)) + ")\n"
-                    "TP2   : $" + sf(tp2) + "  (+" + sf(abs(tp2-price)) + ")\n"
-                    "SL    : $" + sf(sl)  + "  (-" + sf(abs(sl -price)) + ")\n"
+                    "Entry Quality: " + q_emoji + " " + (sf(ea["quality"],0)+"/10" if ea else "—") + "\n"
+                    + entry_guide + "\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
-                    "Score : " + sf(conf,2) + "/10   RR: 1:" + sf(rr,1) + "\n"
-                    "B1: " + sf(b1,3) + "  B2: " + sf(b2,1) + "/10  B3: " + b3v + "\n"
-                    "H4: " + h4d + "  WR: 80.3%  Lot: 0.03\n"
+                    "TP1 : $" + sf(tp)  + "  (+" + sf(abs(tp -price)) + ")\n"
+                    "TP2 : $" + sf(tp2) + "  (+" + sf(abs(tp2-price)) + ")\n"
+                    "SL  : $" + sf(sl)  + "  (-" + sf(abs(sl -price)) + ")\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "Score: " + sf(conf,2) + "/10  RR: 1:" + sf(rr,1) + "\n"
+                    "B1: " + sf(b1,3) + "  B2: " + sf(b2,1) + "/10  H4: " + h4d + "\n"
+                    "WR: 80.3%  Lot: 0.03\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
                     + sname2 + " | " + now_str + "\n"
                     "agent.ceylonpropertylink.com"
                 )
+
+            # Reset tracker when WAIT — allows fresh signal next time
+            if sig == "WAIT" and _last_alerted_sig in ("BUY","SELL"):
+                _last_alerted_sig   = "WAIT"
+                _last_alerted_price = 0.0
+                # Don't reset _last_alerted_time — cooldown still applies
+
+            # ── SL / TP price alerts — bypass cooldown completely ─────────
+            # These protect the trader regardless of signal state
+            _tp1  = sn(last_result.get("tp"),  0)
+            _tp2  = sn(last_result.get("tp2"), 0)
+            _sl   = sn(last_result.get("sl"),  0)
+            _atr  = sn(last_result.get("atr"), 15)
+
+            if _last_alerted_sig == "BUY" and _sl > 0 and price > 0:
+                dist_to_sl = price - _sl
+                dist_to_tp1 = _tp1 - price if _tp1 > 0 else 999
+
+                # SL breach warning — price within 30% of SL distance
+                if 0 < dist_to_sl < _atr * 0.3:
+                    tg(
+                        "⚠️ SL WARNING — BUY TRADE
+"
+                        "━━━━━━━━━━━━━━━━━━━━
+"
+                        "Price : $" + sf(price) + "
+"
+                        "SL    : $" + sf(_sl) + "  (" + sf(dist_to_sl) + " away)
+"
+                        "━━━━━━━━━━━━━━━━━━━━
+"
+                        "Consider closing to protect capital!
+"
+                        "agent.ceylonpropertylink.com"
+                    )
+                    print("   🚨 SL WARNING sent")
+
+                # SL breached — price went below SL
+                elif price < _sl:
+                    tg(
+                        "🛑 SL BREACHED — BUY TRADE
+"
+                        "━━━━━━━━━━━━━━━━━━━━
+"
+                        "Price : $" + sf(price) + "
+"
+                        "SL    : $" + sf(_sl) + "
+"
+                        "Loss  : ~$" + sf(abs(price - _sl) * 3) + "
+"
+                        "━━━━━━━━━━━━━━━━━━━━
+"
+                        "CLOSE TRADE NOW on Exness!
+"
+                        "agent.ceylonpropertylink.com"
+                    )
+                    print("   🛑 SL BREACH alert sent")
+                    _last_alerted_sig = "WAIT"  # reset after SL hit
+
+                # TP1 hit
+                elif _tp1 > 0 and price >= _tp1:
+                    tg(
+                        "🎯 TP1 HIT — BUY TRADE
+"
+                        "━━━━━━━━━━━━━━━━━━━━
+"
+                        "Price : $" + sf(price) + "
+"
+                        "TP1   : $" + sf(_tp1) + "
+"
+                        "Profit: ~$" + sf(abs(price - _last_alerted_price) * 3) + "
+"
+                        "━━━━━━━━━━━━━━━━━━━━
+"
+                        "Move SL to breakeven. Watch for TP2: $" + sf(_tp2) + "
+"
+                        "agent.ceylonpropertylink.com"
+                    )
+                    print("   🎯 TP1 alert sent")
+
+            elif _last_alerted_sig == "SELL" and _sl > 0 and price > 0:
+                dist_to_sl = _sl - price
+
+                if 0 < dist_to_sl < _atr * 0.3:
+                    tg(
+                        "⚠️ SL WARNING — SELL TRADE
+"
+                        "━━━━━━━━━━━━━━━━━━━━
+"
+                        "Price : $" + sf(price) + "
+"
+                        "SL    : $" + sf(_sl) + "  (" + sf(dist_to_sl) + " away)
+"
+                        "━━━━━━━━━━━━━━━━━━━━
+"
+                        "Consider closing to protect capital!
+"
+                        "agent.ceylonpropertylink.com"
+                    )
+                    print("   🚨 SL WARNING sent")
+
+                elif price > _sl:
+                    tg(
+                        "🛑 SL BREACHED — SELL TRADE
+"
+                        "━━━━━━━━━━━━━━━━━━━━
+"
+                        "Price : $" + sf(price) + "
+"
+                        "SL    : $" + sf(_sl) + "
+"
+                        "Loss  : ~$" + sf(abs(price - _sl) * 3) + "
+"
+                        "━━━━━━━━━━━━━━━━━━━━
+"
+                        "CLOSE TRADE NOW on Exness!
+"
+                        "agent.ceylonpropertylink.com"
+                    )
+                    print("   🛑 SL BREACH alert sent")
+                    _last_alerted_sig = "WAIT"
+
+                elif _tp1 > 0 and price <= _tp1:
+                    tg(
+                        "🎯 TP1 HIT — SELL TRADE
+"
+                        "━━━━━━━━━━━━━━━━━━━━
+"
+                        "Price : $" + sf(price) + "
+"
+                        "TP1   : $" + sf(_tp1) + "
+"
+                        "Profit: ~$" + sf(abs(_last_alerted_price - price) * 3) + "
+"
+                        "━━━━━━━━━━━━━━━━━━━━
+"
+                        "Move SL to breakeven. Watch for TP2: $" + sf(_tp2) + "
+"
+                        "agent.ceylonpropertylink.com"
+                    )
+                    print("   🎯 TP1 alert sent")
 
             # ── Periodic WAIT status (every 30 min) ──────────────
             elif _run_count % 15 == 0:
@@ -439,7 +763,7 @@ def scheduler():
             print("[SCHEDULER ERROR] " + short)
             tg("❌ Analysis error:\n" + short + "\n" + now_str)
 
-        time.sleep(get_run_interval())
+        time.sleep(PHASE_A_SECS)  # always 2.5min between cycles
 
 
 threading.Thread(target=scheduler, daemon=True).start()
