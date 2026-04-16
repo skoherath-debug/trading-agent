@@ -261,17 +261,50 @@ class Brain2Analyzer:
         gain=delta.clip(lower=0).rolling(14).mean(); loss=(-delta.clip(upper=0)).rolling(14).mean()
         rsi=(100-(100/(1+gain/(loss+1e-9)))).iloc[-1]
         macd=(close.ewm(span=12,adjust=False).mean()-close.ewm(span=26,adjust=False).mean())
-        hist=(macd-macd.ewm(span=9,adjust=False).mean()).iloc[-1]
-        mc="BULLISH" if hist>0 else "BEARISH"
+        hist=(macd-macd.ewm(span=9,adjust=False).mean())
+        hist_now=hist.iloc[-1]; hist_prev=hist.iloc[-2]
+        mc="BULLISH" if hist_now>0 else "BEARISH"
+        # RSI slope
+        rsi_series = 100-(100/(1+gain/(loss+1e-9)))
+        rsi_slope = rsi_series.iloc[-1] - rsi_series.iloc[-5]
         if rsi>70: state="OVERBOUGHT"
         elif rsi<30: state="OVERSOLD"
         elif rsi>55 and mc=="BULLISH": state="BULLISH_MOMENTUM"
         elif rsi<45 and mc=="BEARISH": state="BEARISH_MOMENTUM"
         else: state="NEUTRAL"
-        return {"rsi":round(rsi,2),"macd_histogram":round(hist,4),"macd_cross":mc,"state":state,
-                "divergence_detected":False,
-                "score":8 if state=="BULLISH_MOMENTUM" else 2 if state=="BEARISH_MOMENTUM"
-                        else 5 if state=="NEUTRAL" else 3 if state=="OVERBOUGHT" else 7}
+        # ── Rocket Score (XAU/USD bullish momentum 0-100) ──────────────
+        rocket = 0
+        ema9  = close.ewm(span=9, adjust=False).mean()
+        ema21 = close.ewm(span=21, adjust=False).mean()
+        price = close.iloc[-1]
+        if rsi < 35: rocket += 25              # oversold bounce setup
+        elif rsi < 45 and rsi_slope > 2: rocket += 15  # recovering
+        if hist_now > 0 and hist_now > hist_prev: rocket += 20  # MACD rising
+        if price > ema9.iloc[-1]: rocket += 15  # price above fast EMA
+        if ema9.iloc[-1] > ema21.iloc[-1]: rocket += 15  # EMA aligned bullish
+        if rsi_slope > 3: rocket += 15         # RSI rising strongly
+        rocket = min(rocket, 100)
+        # ── Waterfall Score (XAU/USD bearish momentum 0-100) ───────────
+        waterfall = 0
+        if rsi > 65: waterfall += 25
+        elif rsi > 55 and rsi_slope < -2: waterfall += 15
+        if hist_now < 0 and hist_now < hist_prev: waterfall += 20
+        if price < ema9.iloc[-1]: waterfall += 15
+        if ema9.iloc[-1] < ema21.iloc[-1]: waterfall += 15
+        if rsi_slope < -3: waterfall += 15
+        waterfall = min(waterfall, 100)
+        # Momentum score for confluence
+        if rocket >= 60:   score = 8
+        elif rocket >= 40: score = 7
+        elif waterfall >= 60: score = 2
+        elif waterfall >= 40: score = 3
+        elif state=="NEUTRAL": score = 5
+        elif state=="OVERBOUGHT": score = 3
+        else: score = 7
+        return {"rsi":round(rsi,2),"macd_histogram":round(hist_now,4),"macd_cross":mc,
+                "state":state,"rsi_slope":round(rsi_slope,2),
+                "rocket_score":rocket,"waterfall_score":waterfall,
+                "divergence_detected":False,"score":score}
 
     def analyze_volatility(self, df):
         h,l,c=df["high"],df["low"],df["close"]
@@ -584,16 +617,10 @@ def run_analysis():
 
         if _td_df is not None and len(_td_df) > 50:
             df = _td_df
-            print(f"[DATA] Twelve Data: {len(df)} bars")
+            print(f"[DATA] Twelve Data: {len(df)} bars ✅ REAL DATA")
         else:
-            df = yf.download(SYMBOL, period="60d", interval="1h", auto_adjust=False, progress=False)
-            df.columns = [col[0].lower() if isinstance(col,tuple) else col.lower() for col in df.columns]
-            df = df[["open","high","low","close","volume"]].dropna()
-            df.index = pd.to_datetime(df.index)
-            try: df.index = df.index.tz_convert(None)
-            except Exception: pass
-            df = df[df.index.dayofweek < 5]
-            print(f"[DATA] yfinance fallback: {len(df)} bars")
+            # NO YFINANCE — real data only policy
+            raise ValueError("Twelve Data failed and yfinance disabled — real data only policy. Check TD_KEY.")
 
         if len(df) < 10: raise ValueError(f"Only {len(df)} rows")
         health["data_feed"] = {"ok":True,"msg":f"{len(df)} bars loaded"}
@@ -672,14 +699,27 @@ def run_analysis():
 
     # ── Signal fusion ────────────────────────────────────────────────────────
     fused = (b1_score*0.4) + (b2_score*0.6)
+    rocket    = m["momentum"].get("rocket_score", 0)
+    waterfall = m["momentum"].get("waterfall_score", 0)
 
-    # ── Fix: normalise B2 signal (BULLISH→BUY, BEARISH→SELL) ────────────────
+    # ── Normalise B2 signal ──────────────────────────────────────────────────
     b2_dir = "BUY"  if any(x in b2_sig.upper() for x in ["BUY","BULL"]) else              "SELL" if any(x in b2_sig.upper() for x in ["SELL","BEAR"]) else "WAIT"
 
     # ── Alignment bonus: B1 + B2 agree ──────────────────────────────────────
     if b1_dir == b2_dir and b1_dir != "WAIT":
         fused += 0.5
         print(f"   ✅ B1+B2 aligned ({b1_dir}) → fused +0.5")
+
+    # ── Rocket/Waterfall momentum gate ──────────────────────────────────────
+    # Only allow BUY if Rocket >= 50 (strong bullish momentum confirmed)
+    # Only allow SELL if Waterfall >= 50 (strong bearish momentum confirmed)
+    if fused >= 6.3:
+        if sig == "BUY"  and rocket < 50:
+            print(f"   ⛔ Rocket={rocket} < 50 — BUY momentum not confirmed → WAIT")
+            fused = min(fused, 6.2)
+        elif sig == "SELL" and waterfall < 50:
+            print(f"   ⛔ Waterfall={waterfall} < 50 — SELL momentum not confirmed → WAIT")
+            fused = min(fused, 6.2)
 
     # ── H4 directional bonus ─────────────────────────────────────────────────
     # Applied BEFORE H4 veto so aligned H4 boosts signal
@@ -695,9 +735,30 @@ def run_analysis():
     except Exception:
         pass
 
-    if fused>=6.3: sig,conf = "BUY","HIGH" if fused>=8 else "MEDIUM"
-    elif fused<=3.7: sig,conf = "SELL","HIGH" if fused<=2 else "MEDIUM"
+    if fused>=6.5: sig,conf = "BUY","HIGH" if fused>=8 else "MEDIUM"
+    elif fused<=3.5: sig,conf = "SELL","HIGH" if fused<=2 else "MEDIUM"
     else: sig,conf = "WAIT","LOW"
+
+    # Rocket/Waterfall gate — after signal set
+    if sig == "BUY" and rocket < 50:
+        print("   Rocket=" + str(rocket) + "<50 — not confirmed WAIT")
+        sig = "WAIT"; conf = "LOW"
+    elif sig == "SELL" and waterfall < 50:
+        print("   Waterfall=" + str(waterfall) + "<50 — not confirmed WAIT")
+        sig = "WAIT"; conf = "LOW"
+    elif sig == "BUY":  print("   Rocket=" + str(rocket) + " CONFIRMED BUY")
+    elif sig == "SELL": print("   Waterfall=" + str(waterfall) + " CONFIRMED SELL")
+
+    # ── Rocket/Waterfall gate AFTER signal set ────────────────────────────────
+    if sig == "BUY" and rocket < 50:
+        print(f"   ⛔ Rocket={rocket}<50 — momentum not confirmed → WAIT")
+        sig  = "WAIT"; conf = "LOW"; fused = min(fused, 6.4)
+    elif sig == "SELL" and waterfall < 50:
+        print(f"   ⛔ Waterfall={waterfall}<50 — momentum not confirmed → WAIT")
+        sig  = "WAIT"; conf = "LOW"; fused = min(fused, 6.4)
+    else:
+        if sig == "BUY":  print(f"   🚀 Rocket={rocket} CONFIRMED → BUY")
+        if sig == "SELL": print(f"   💧 Waterfall={waterfall} CONFIRMED → SELL")
 
     price   = round(float(df_live["close"].iloc[-1]), 2)
     atr_raw = float(m["volatility"]["atr14"])
@@ -842,4 +903,6 @@ def run_analysis():
         "sr_flip_active":   sr_flip_active,
         "tight_range":      tight_range,
         "sr_gap":           round(sr_gap, 2),
+        "rocket_score":     rocket,
+        "waterfall_score":  waterfall,
     })
