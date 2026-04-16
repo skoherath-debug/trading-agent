@@ -581,28 +581,29 @@ def run_analysis():
         THRESHOLD = 0.60
         features  = {"features":[]}
 
-    # ── Data feed ────────────────────────────────────────────────────────────
+    # ── Data feed — tries ALL 3 TD keys then yfinance fallback ─────────────
     try:
         _td_df = None
-        if _TD_KEYS:
+        import requests as _req
+        # Try every available TD key until one works
+        _all_keys = [k for k in [
+            os.environ.get("TD_KEY",  "f3883b7831a540cda02cfafcfe77e082"),
+            os.environ.get("TD_KEY2", "41c8cfdf490b4bf4a0d388e716a32453"),
+            os.environ.get("TD_KEY3", "f58b0a482f1443e78fb23cf8975b44d9"),
+        ] if k]
+        for _ki, _active_key in enumerate(_all_keys):
             try:
-                import requests as _req
-                _active_key = get_td_key()
+                print(f"[DATA] Trying TD key {_ki+1}/{len(_all_keys)}...")
                 _r = _req.get("https://api.twelvedata.com/time_series", params={
                     "symbol":"XAU/USD","interval":"1h","outputsize":500,
                     "apikey":_active_key,"timezone":"UTC","format":"JSON"
                 }, timeout=30)
                 _td = _r.json()
-                # Detect rate limit / exhausted key → rotate
-                if "code" in _td and _td.get("code") in [429, 400, 403]:
-                    rotate_td_key(f"API error code {_td.get('code')}: {_td.get('message','')}")
-                    _active_key = get_td_key()
-                    _r2 = _req.get("https://api.twelvedata.com/time_series", params={
-                        "symbol":"XAU/USD","interval":"1h","outputsize":500,
-                        "apikey":_active_key,"timezone":"UTC","format":"JSON"
-                    }, timeout=30)
-                    _td = _r2.json()
-                if "values" in _td:
+                # Check for any error (rate limit, exhausted, invalid)
+                if "code" in _td or "message" in _td and "values" not in _td:
+                    print(f"[DATA] TD key {_ki+1} error: {_td.get('message','unknown')} — trying next")
+                    continue
+                if "values" in _td and len(_td["values"]) > 50:
                     _td_df = pd.DataFrame(_td["values"])
                     _td_df["datetime"] = pd.to_datetime(_td_df["datetime"])
                     _td_df = _td_df.set_index("datetime").sort_index()
@@ -612,15 +613,32 @@ def run_analysis():
                     _td_df = _td_df[[c for c in ["open","high","low","close"] if c in _td_df.columns]].dropna()
                     if "volume" not in _td_df.columns:
                         _td_df["volume"] = 0
-            except Exception as _e:
-                print(f"[DATA] Twelve Data failed: {_e}")
+                    # Update rotation index to this working key
+                    _td_key_index = _ki
+                    print(f"[DATA] TD key {_ki+1} OK: {len(_td_df)} bars ✅")
+                    break
+            except Exception as _ke:
+                print(f"[DATA] TD key {_ki+1} exception: {_ke}")
+                continue
 
         if _td_df is not None and len(_td_df) > 50:
             df = _td_df
-            print(f"[DATA] Twelve Data: {len(df)} bars ✅ REAL DATA")
         else:
-            # NO YFINANCE — real data only policy
-            raise ValueError("Twelve Data failed and yfinance disabled — real data only policy. Check TD_KEY.")
+            # All TD keys failed — emergency yfinance fallback
+            print("[DATA] All TD keys exhausted — using yfinance emergency fallback")
+            try:
+                import yfinance as yf
+                df = yf.download("GC=F", period="60d", interval="1h",
+                                 auto_adjust=False, progress=False)
+                df.columns = [c[0].lower() if isinstance(c,tuple) else c.lower() for c in df.columns]
+                df = df[["open","high","low","close"]].dropna()
+                df.index = pd.to_datetime(df.index)
+                try: df.index = df.index.tz_convert(None)
+                except: pass
+                df = df[df.index.dayofweek < 5]
+                print(f"[DATA] yfinance fallback: {len(df)} bars ⚠️")
+            except Exception as yfe:
+                raise ValueError(f"All 3 TD keys failed + yfinance failed: {yfe}")
 
         if len(df) < 10: raise ValueError(f"Only {len(df)} rows")
         health["data_feed"] = {"ok":True,"msg":f"{len(df)} bars loaded"}
