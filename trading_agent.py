@@ -6,7 +6,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8172828888:AAFWCvtCl1F-Kj5yOv
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT",  "7132630179")
 # ── Groq API key rotation ─────────────────────────────────────────────────────
 _GROQ_KEYS = [k for k in [
-    os.environ.get("GROQ_API_KEY",  "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"),
+    os.environ.get("GROQ_API_KEY",  "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"),
     os.environ.get("GROQ_API_KEY2", "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"),
     os.environ.get("GROQ_API_KEY3", "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"),
 ] if k.strip()]
