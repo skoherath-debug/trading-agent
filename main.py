@@ -41,6 +41,15 @@ except Exception as e:
     IMPROVEMENTS_LOADED = False
     print(f"⚠️  Improvements not available: {e}")
 
+# ── Trade Coach (single-trade state machine) ──────────────────────────
+try:
+    import trade_coach
+    COACH_LOADED = True
+    print("✅ Trade Coach loaded")
+except Exception as e:
+    COACH_LOADED = False
+    print(f"⚠️  Trade Coach not available: {e}")
+
 # ── App ───────────────────────────────────────────────────────
 api = FastAPI(title="XAU/USD Triple Brain Agent · Phase 30")
 api.add_middleware(
@@ -433,7 +442,7 @@ def entry_analysis_ep():
 def rocket_ep():
     """Phase 30 — latest Rocket/Waterfall micro-entry status. [FIX-A] _rw_result pre-initialized."""
     try:
-        res = _rw_result  # now safe — pre-initialized at module level
+        res = _rw_result
         if res:
             return JSONResponse(content=clean(res))
     except NameError:
@@ -443,6 +452,79 @@ def rocket_ep():
         "msg":"Warming up — first 1m scan in <60s",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
+
+# ═══════════════════════════════════════════════════════════════════
+# TRADE COACH ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════
+@api.get("/coach-status")
+def coach_status_ep():
+    """Return the current state of the trade coach — for dashboard display."""
+    if not COACH_LOADED:
+        return {"loaded": False, "state": "UNAVAILABLE"}
+    try:
+        s = trade_coach.load_state()
+        # Add human-readable fields for dashboard
+        if s.get("trade_open_ts"):
+            s["trade_age_min"] = int((time.time() - s["trade_open_ts"]) / 60)
+        if s.get("last_closed_ts"):
+            s["cooldown_remaining_sec"] = max(0, int(
+                trade_coach.MIN_TIME_BETWEEN_SEC - (time.time() - s["last_closed_ts"])
+            ))
+        s["loaded"] = True
+        return JSONResponse(content=clean(s))
+    except Exception as e:
+        return JSONResponse(content={"loaded": True, "state": "ERROR", "error": str(e)})
+
+@api.post("/telegram-webhook")
+async def telegram_webhook_ep(payload: dict):
+    """Telegram webhook — receives YES/NO button callbacks.
+    Also called by the dashboard YES/SKIP buttons with same payload shape.
+    Set this as your bot's webhook URL via:
+      curl -F "url=https://...railway.app/telegram-webhook" \
+           https://api.telegram.org/bot<TOKEN>/setWebhook
+    """
+    if not COACH_LOADED or not payload:
+        return {"ok": False}
+    try:
+        cb = payload.get("callback_query")
+        if not cb:
+            return {"ok": True, "msg": "no callback"}
+
+        data = cb.get("data", "")
+        callback_id = cb.get("id")
+
+        # Answer the callback (removes the "loading" on Telegram button)
+        # Skip for dashboard (callback_id == 'dashboard')
+        if callback_id and callback_id != 'dashboard':
+            try:
+                req.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                    json={"callback_query_id": callback_id},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+        state = trade_coach.load_state()
+        if data == "trade_yes":
+            state = trade_coach.on_user_confirmed_yes(state, TELEGRAM_TOKEN, TELEGRAM_CHAT)
+            return {"ok": True, "action": "trade_started"}
+        elif data == "trade_no":
+            state = trade_coach.on_user_confirmed_no(state, TELEGRAM_TOKEN, TELEGRAM_CHAT)
+            return {"ok": True, "action": "trade_skipped"}
+        return {"ok": True, "msg": f"unknown callback: {data}"}
+    except Exception as e:
+        print(f"[WEBHOOK] Error: {e}")
+        return {"ok": False, "error": str(e)}
+
+@api.post("/coach-reset")
+def coach_reset_ep():
+    """Emergency reset — forces coach back to SCANNING state.
+    Call this if coach gets stuck."""
+    if not COACH_LOADED:
+        return {"ok": False}
+    state = trade_coach.reset_state_to_scanning()
+    return {"ok": True, "state": state["state"]}
 
 @api.get("/files")
 def files_ep():
@@ -564,110 +646,53 @@ def scheduler():
                 except Exception as e:
                     print("   Improvements error: " + str(e))
 
-            # ── Alert gating ──────────────────────────────────────
-            global _last_alerted_sig, _last_alerted_price, _last_alerted_time
-            now_ts       = time.time()
-            cooldown_ok  = (now_ts - _last_alerted_time) >= ALERT_COOLDOWN_SECS
-            dir_changed  = sig != _last_alerted_sig
-            price_moved  = abs(price - _last_alerted_price) > 8.0
+            # ═══════════════════════════════════════════════════════
+            # TRADE COACH — single-trade state machine
+            # All entry / exit / mid-trade alerts routed through here
+            # ═══════════════════════════════════════════════════════
+            if COACH_LOADED:
+                try:
+                    coach_state = trade_coach.load_state()
 
-            session_quality_ok = sq2 in ("HIGH", "MEDIUM")
-            rocket_score    = sn((result.get("brain2") or {}).get("details", {}).get("rocket_score"), 0)
-            waterfall_score = sn((result.get("brain2") or {}).get("details", {}).get("waterfall_score"), 0)
-            momentum_ok = (
-                (sig == "BUY"  and rocket_score    >= 50) or
-                (sig == "SELL" and waterfall_score >= 50)
-            )
-
-            should_alert = (cooldown_ok and session_quality_ok and momentum_ok) or dir_changed
-
-            if sig in ("BUY", "SELL") and should_alert:
-                # [FIX-D] Compute mins_since BEFORE resetting timestamp
-                mins_since = round((now_ts - _last_alerted_time)/60, 1) if _last_alerted_time else 0
-                _last_alerted_sig   = sig
-                _last_alerted_price = price
-                _last_alerted_time  = now_ts
-                print("   📱 ALERT: " + sig + " (last alert " + str(mins_since) + "m ago)")
-                icon = "📈" if sig == "BUY" else "📉"
-                rr   = round(abs(tp-price)/abs(sl-price),1) if abs(sl-price) > 0 else 0
-
-                if IMPROVEMENTS_LOADED:
-                    try:
-                        tracker.log_trade(
-                            entry_time=datetime.now(timezone.utc).isoformat(),
-                            entry_price=price, exit_time=datetime.now(timezone.utc).isoformat(),
-                            exit_price=price,  signal=sig, b1_score=b1, b2_score=b2,
-                            b3_score=conf,     session=sname2
-                        )
-                    except Exception: pass
-
-                ea = get_entry_analysis(result, price)
-                if ea:
-                    q_emoji = "🟢" if ea["quality"]>=8 else "🟡" if ea["quality"]>=5 else "🔴"
-                    entry_guide = (
-                        "Option A (Market): $" + sf(price) + "\n"
-                        "Option B (Limit):  $" + sf(ea["limit_price"]) + " (+" + sf(ea["limit_offset"]) + " better)\n"
-                        "Valid zone: $" + sf(ea["zone_low"]) + " — $" + sf(ea["zone_high"]) + "\n"
-                        "If price > $" + sf(ea["zone_high"]) + " → SKIP"
+                    # Check awaiting timeout (auto-skip if 5min passed)
+                    coach_state = trade_coach.check_awaiting_timeout(
+                        coach_state, TELEGRAM_TOKEN, TELEGRAM_CHAT
                     )
-                else:
-                    entry_guide = "Entry: $" + sf(price)
-                    q_emoji = "🟡"
 
-                mom_line = ("🚀 Rocket: " + str(int(rocket_score)) + "/100\n") if sig=="BUY" else ("💧 Waterfall: " + str(int(waterfall_score)) + "/100\n")
-                tg(
-                    icon + " " + sig + " XAU/USD\n"
-                    + "━━━━━━━━━━━━━━━━━━━━\n"
-                    + "Entry: $" + sf(price) + "  Quality: " + q_emoji + " " + (sf(ea["quality"],0)+"/10" if ea else "—") + "\n"
-                    + entry_guide + "\n"
-                    + "━━━━━━━━━━━━━━━━━━━━\n"
-                    + "TP1: $" + sf(tp)  + " (+" + sf(abs(tp -price)) + ")  TP2: $" + sf(tp2) + "\n"
-                    + "SL:  $" + sf(sl)  + " (-" + sf(abs(sl -price)) + ")\n"
-                    + "━━━━━━━━━━━━━━━━━━━━\n"
-                    + "Score: " + sf(conf,2) + "/10  RR: 1:" + sf(rr,1) + "\n"
-                    + "B1: " + sf(b1,3) + "  B2: " + sf(b2,1) + "/10  H4: " + h4d + "\n"
-                    + mom_line
-                    + "WR: 80.3%  Lot: 0.03\n"
-                    + "━━━━━━━━━━━━━━━━━━━━\n"
-                    + sname2 + " | " + now_str + "\n"
-                    + "agent.ceylonpropertylink.com"
-                )
+                    # If no trade is open, check if we should fire entry alert
+                    if coach_state["state"] == trade_coach.STATE_SCANNING:
+                        ok, reason = trade_coach.should_alert_entry(result, coach_state)
+                        if ok:
+                            coach_state = trade_coach.on_signal_fired(
+                                result, coach_state, TELEGRAM_TOKEN, TELEGRAM_CHAT
+                            )
+                            print(f"[COACH] 🎯 Entry alert fired — awaiting confirmation")
+                        else:
+                            print(f"[COACH] Scanning... skip reason: {reason}")
 
-            if sig == "WAIT" and _last_alerted_sig in ("BUY","SELL"):
-                _last_alerted_sig   = "WAIT"
-                _last_alerted_price = 0.0
+                    # If trade is open, run mid-trade monitoring
+                    elif coach_state["state"] == trade_coach.STATE_OPEN:
+                        # Use fresh live price for monitoring
+                        monitor_price = sn(_price_cache.get("price"), price)
+                        coach_state = trade_coach.check_trade_open(
+                            coach_state,
+                            monitor_price,
+                            result,
+                            _rw_result,
+                            TELEGRAM_TOKEN,
+                            TELEGRAM_CHAT,
+                        )
 
-            # ── SL / TP price alerts ──────────────────────────────
-            _tp1  = sn(last_result.get("tp"),  0)
-            _tp2  = sn(last_result.get("tp2"), 0)
-            _sl   = sn(last_result.get("sl"),  0)
-            _atr  = sn(last_result.get("atr"), 15)
+                    elif coach_state["state"] == trade_coach.STATE_AWAITING:
+                        mins = int((time.time() - coach_state.get("awaiting_since_ts", 0)) / 60)
+                        print(f"[COACH] Awaiting user YES/NO confirmation ({mins}m)")
 
-            if _last_alerted_sig == "BUY" and _sl > 0 and price > 0:
-                dist_to_sl = price - _sl
-                if 0 < dist_to_sl < _atr * 0.3:
-                    tg("⚠️ SL WARNING BUY\nPrice: $" + sf(price) + "\nSL: $" + sf(_sl) + " (" + sf(dist_to_sl) + " away)\nConsider closing!\nagent.ceylonpropertylink.com")
-                    print("SL WARNING sent")
-                elif price < _sl:
-                    tg("🛑 SL BREACHED BUY\nPrice: $" + sf(price) + "\nSL: $" + sf(_sl) + "\nLoss: ~$" + sf(abs(price-_sl)*3) + "\nCLOSE NOW on Exness!\nagent.ceylonpropertylink.com")
-                    print("SL BREACH sent")
-                    _last_alerted_sig = "WAIT"
-                elif _tp1 > 0 and price >= _tp1:
-                    tg("🎯 TP1 HIT BUY\nPrice: $" + sf(price) + "\nTP1: $" + sf(_tp1) + "\nProfit: ~$" + sf(abs(price-_last_alerted_price)*3) + "\nMove SL to breakeven. TP2: $" + sf(_tp2) + "\nagent.ceylonpropertylink.com")
-                    print("TP1 HIT sent")
-
-            elif _last_alerted_sig == "SELL" and _sl > 0 and price > 0:
-                dist_to_sl = _sl - price
-                if 0 < dist_to_sl < _atr * 0.3:
-                    tg("⚠️ SL WARNING SELL\nPrice: $" + sf(price) + "\nSL: $" + sf(_sl) + " (" + sf(dist_to_sl) + " away)\nConsider closing!\nagent.ceylonpropertylink.com")
-                    print("SL WARNING sent")
-                elif price > _sl:
-                    tg("🛑 SL BREACHED SELL\nPrice: $" + sf(price) + "\nSL: $" + sf(_sl) + "\nLoss: ~$" + sf(abs(price-_sl)*3) + "\nCLOSE NOW on Exness!\nagent.ceylonpropertylink.com")
-                    print("SL BREACH sent")
-                    _last_alerted_sig = "WAIT"
-                elif _tp1 > 0 and price <= _tp1:
-                    tg("🎯 TP1 HIT SELL\nPrice: $" + sf(price) + "\nTP1: $" + sf(_tp1) + "\nProfit: ~$" + sf(abs(_last_alerted_price-price)*3) + "\nMove SL to breakeven. TP2: $" + sf(_tp2) + "\nagent.ceylonpropertylink.com")
-                    print("TP1 HIT sent")
+                except Exception as e:
+                    print(f"[COACH ERROR] {str(e)[:150]}")
+                    traceback.print_exc()
+            else:
+                # Fallback to old alert logic if coach failed to load
+                print("[COACH] Not loaded — legacy alerts disabled")
 
         except Exception as e:
             short = str(e)[:200]
@@ -743,115 +768,29 @@ def rocket_scheduler():
             print(f"[RW] 🚀{rocket} 💧{waterfall} | {signal} | ${sf(price)} | RSI={sf(rsi,1)} "
                   f"| slope R{r_slope:+.1f}/W{w_slope:+.1f}{b4_tag}")
 
-            now_ts = _t.time()
-            cooldown_ok = (now_ts - _rw_alert_time) >= _RW_ENTRY_COOLDOWN
-            dir_flip    = (signal in ("ROCKET","WATERFALL") and
-                           signal.split("_")[0] != _rw_alert_dir.split("_")[0])
+            # ═══════════════════════════════════════════════════════
+            # NOTE: Rocket/Waterfall Telegram alerts are DISABLED.
+            # The Trade Coach owns all Telegram notifications now.
+            # Rocket data is still published to /rocket-status for the
+            # dashboard and used by the coach for mid-trade reversal warnings.
+            # ═══════════════════════════════════════════════════════
 
-            # ── [PHASE 31] BRAIN 4 PREDICTION ALERT (highest priority early warning) ──
-            if signal in ("ROCKET_PREDICTED", "WATERFALL_PREDICTED"):
-                b4_dir = "ROCKET" if "ROCKET" in signal else "WATERFALL"
-                b4_cooldown_ok = (now_ts - _rw_b4_last_ts) >= B4_COOLDOWN
-                b4_dir_change  = b4_dir != _rw_b4_last_dir
-
-                if b4_cooldown_ok or b4_dir_change:
-                    emoji   = "🔮🚀" if b4_dir == "ROCKET" else "🔮💧"
-                    dir_wrd = "BUY"  if b4_dir == "ROCKET" else "SELL"
-                    prob    = b4_r if b4_dir == "ROCKET" else b4_w
-
-                    tg(emoji + " BRAIN 4 PREDICTION — XAU/USD\n"
-                       + "━━━━━━━━━━━━━━━━━━━━\n"
-                       + "ML says " + dir_wrd + " momentum likely\n"
-                       + "within next 3 minutes\n"
-                       + "━━━━━━━━━━━━━━━━━━━━\n"
-                       + "Confidence: " + f"{prob*100:.0f}%\n"
-                       + "Current score: R=" + str(rocket) + " W=" + str(waterfall) + "\n"
-                       + "Price: $" + sf(price) + "  RSI: " + sf(rsi,1) + "\n"
-                       + "━━━━━━━━━━━━━━━━━━━━\n"
-                       + "Prepare entry — wait for full signal\n"
-                       + now_s + " | Phase 31 B4\n"
-                       + "agent.ceylonpropertylink.com")
-                    _rw_b4_last_dir = b4_dir
-                    _rw_b4_last_ts  = now_ts
-                    print(f"[RW] B4 PREDICTION sent: {dir_wrd} prob={prob:.2f}")
-
-            # ── [PHASE 31] SLOPE-BASED IMMINENT ALERT (fast, no ML needed) ──
-            elif signal in ("ROCKET_IMMINENT", "WATERFALL_IMMINENT"):
-                imm_dir = "ROCKET" if "ROCKET" in signal else "WATERFALL"
-                imm_cooldown_ok = (now_ts - _rw_imminent_last_ts) >= IMMINENT_COOLDOWN
-                imm_dir_change  = imm_dir != _rw_imminent_last_dir
-
-                if imm_cooldown_ok or imm_dir_change:
-                    emoji   = "⚠️🚀" if imm_dir == "ROCKET" else "⚠️💧"
-                    dir_wrd = "BUY"  if imm_dir == "ROCKET" else "SELL"
-                    score   = rocket if imm_dir == "ROCKET" else waterfall
-                    slope   = r_slope if imm_dir == "ROCKET" else w_slope
-                    eta     = r_eta if imm_dir == "ROCKET" else w_eta
-                    eta_str = f"~{int(eta)}s" if eta else "soon"
-
-                    tg(emoji + " " + imm_dir + " IMMINENT — XAU/USD\n"
-                       + "━━━━━━━━━━━━━━━━━━━━\n"
-                       + "Score: " + str(score) + "/100 (rising)\n"
-                       + "Slope: +" + sf(slope,1) + "/min\n"
-                       + "ETA to ignition: " + eta_str + "\n"
-                       + "━━━━━━━━━━━━━━━━━━━━\n"
-                       + "Price: $" + sf(price) + "  RSI: " + sf(rsi,1) + "\n"
-                       + "Pre-position: " + dir_wrd + "\n"
-                       + "Wait for ENTRY ALERT to fire\n"
-                       + now_s + " | Phase 31 Slope\n"
-                       + "agent.ceylonpropertylink.com")
-                    _rw_imminent_last_dir = imm_dir
-                    _rw_imminent_last_ts  = now_ts
-                    print(f"[RW] IMMINENT sent: {dir_wrd} score={score} slope={slope:+.1f}/min eta={eta_str}")
-
-            # PRE-ALERT (building) — only if no imminent/predicted already fired
-            elif signal in ("ROCKET_BUILDING","WATERFALL_BUILDING") and not _rw_pre_alerted:
-                emoji = "🚀" if "ROCKET" in signal else "💧"
-                score = rocket if "ROCKET" in signal else waterfall
-                mom_str = "🚀 Rocket: " if "ROCKET" in signal else "💧 Waterfall: "
-                tg(emoji + " MOMENTUM BUILDING — XAU/USD\n"
-                   + "━━━━━━━━━━━━━━━━━━━━\n"
-                   + mom_str + str(score) + "/100\n"
-                   + "Price: $" + sf(price) + "\n"
-                   + "RSI: " + sf(rsi,1) + "\n"
-                   + "━━━━━━━━━━━━━━━━━━━━\n"
-                   + "GET READY — Signal building\n"
-                   + "Watch for ENTRY ALERT\n"
-                   + now_s + " | agent.ceylonpropertylink.com")
-                _rw_pre_alerted = True
-                print(f"[RW] Pre-alert sent: {signal} {score}/100")
-
-            # ENTRY ALERT (actual ignition)
-            elif signal in ("ROCKET","WATERFALL") and (cooldown_ok or dir_flip):
-                emoji    = "⚡🚀" if signal == "ROCKET" else "⚡💧"
-                dir_word = "BUY" if signal == "ROCKET" else "SELL"
-                score    = rocket if signal == "ROCKET" else waterfall
-                max_slip = round(atr * 0.15, 2)
-                rr       = round(abs(tp1-entry)/abs(sl-entry),1) if abs(sl-entry)>0 else 0
-
-                mom_str2 = "🚀 Rocket: " if signal=="ROCKET" else "💧 Waterfall: "
-                tg(emoji + " " + dir_word + " NOW — XAU/USD\n"
-                   + "━━━━━━━━━━━━━━━━━━━━\n"
-                   + mom_str2 + str(score) + "/100  RSI: " + sf(rsi,1) + "\n"
-                   + "━━━━━━━━━━━━━━━━━━━━\n"
-                   + "Entry: $" + sf(entry) + "  (±$" + sf(max_slip) + ")\n"
-                   + "TP1  : $" + sf(tp1) + "  (+" + sf(abs(tp1-entry)) + ")\n"
-                   + "TP2  : $" + sf(tp2) + "  (+" + sf(abs(tp2-entry)) + ")\n"
-                   + "SL   : $" + sf(sl) + "  (-" + sf(abs(sl-entry)) + ")\n"
-                   + "━━━━━━━━━━━━━━━━━━━━\n"
-                   + "RR: 1:" + sf(rr,1) + "  ATR: $" + sf(atr) + "\n"
-                   + "Skip if price moved >$" + sf(max_slip) + "\n"
-                   + now_s + " | Phase 30 | agent.ceylonpropertylink.com")
-                _rw_alert_dir   = signal
-                _rw_alert_time  = now_ts
-                _rw_alert_price = price
-                _rw_alerted     = True
-                _rw_pre_alerted = False
-                print(f"[RW] ENTRY ALERT sent: {dir_word} ${sf(price)} R={rocket} W={waterfall}")
-
-            if signal == "WAIT" and _rw_pre_alerted:
-                _rw_pre_alerted = False
-                _rw_alerted     = False
+            # ── 1-MIN TRADE MONITORING (only when trade is open) ────────
+            # Main scheduler runs every 2.5min — not fast enough for proper
+            # trade updates. Hook the coach into this 60s tick so you get
+            # per-minute price updates during an open trade.
+            if COACH_LOADED:
+                try:
+                    cs = trade_coach.load_state()
+                    if cs["state"] == trade_coach.STATE_OPEN and price > 100:
+                        trade_coach.check_trade_open(
+                            cs, price,
+                            None,        # no fresh main analysis at 60s cadence
+                            result,      # but we DO have fresh rocket data
+                            TELEGRAM_TOKEN, TELEGRAM_CHAT
+                        )
+                except Exception as ce:
+                    print(f"[COACH-60s] {str(ce)[:100]}")
 
         except Exception as e:
             print(f"[RW] Scheduler error: {str(e)[:150]}")
