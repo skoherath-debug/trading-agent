@@ -763,6 +763,9 @@ def run_analysis():
 
     sr_gap = abs(resistance - support)
     tight_range = sr_gap < 10.0
+    # [PHASE 31b] Publish sr_gap to Phase 30 scanner so it can block during chop
+    global _last_main_sr_gap
+    _last_main_sr_gap = sr_gap
     if tight_range:
         print(f"⚠️  Tight range: S/R gap ${sr_gap:.2f} < $10 → WAIT")
         sig   = "WAIT"
@@ -919,6 +922,25 @@ _RW_COOLDOWN       = _RW_ENTRY_COOLDOWN
 _rw_alert_ts       = _rw_alert_time
 _rw_entry_alerted  = False
 _rw_result         = None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 31b — SIGNAL STABILITY GATE (fixes BUY/SELL flip-flop)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Problem: 1-min bars are too noisy. Score 60 fires on one candle, drops next.
+# Fix:
+#   1. Require 3 consecutive ticks above threshold (persistence)
+#   2. Require opposing score to be low (no conflicting momentum)
+#   3. Block entirely in tight S/R range (use main signal's sr_gap)
+#   4. Raise entry threshold 60 → 70
+#   5. Main signal's latest sr_gap shared via this global
+_stability_consecutive_rocket    = 0   # consecutive ticks rocket >= threshold
+_stability_consecutive_waterfall = 0   # consecutive ticks waterfall >= threshold
+_stability_required_ticks        = 3   # must persist 3 ticks (3 min at 60s) before alert
+_stability_entry_threshold       = 70  # was 60 — raised for 1m noise tolerance
+_stability_opposing_max          = 40  # opposing score must be below this
+_stability_min_sr_gap            = 10.0  # block all alerts if sr_gap below this
+# Shared from main signal run — updated by run_analysis()
+_last_main_sr_gap = 999.0              # starts large → allows scans until first main run
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PHASE 31 — PREDICTIVE LAYER (Option 1: Slope + Option 2: Brain 4 ML)
@@ -1371,36 +1393,77 @@ def run_rocket_analysis(live_price=None):
     # Scale 1min ATR up to H1-equivalent for TP/SL (1m ATR ~= 1/5 of H1 ATR)
     atr    = max(atr_1m * 5, 8.0)
 
-    if rocket >= _RW_ENTRY_THRESHOLD:
+    # ═══════════════════════════════════════════════════════════════════════
+    # PHASE 31b — STABILITY GATE
+    # Refuses to emit ROCKET/WATERFALL unless ALL of these are true:
+    #   1. Score ≥ entry threshold (70, was 60)
+    #   2. Score has been ≥ threshold for 3 consecutive ticks (no spikes)
+    #   3. Opposing score is ≤ 40 (clean single direction)
+    #   4. Main signal's S/R gap ≥ $10 (not in tight chop)
+    # ═══════════════════════════════════════════════════════════════════════
+    global _stability_consecutive_rocket, _stability_consecutive_waterfall
+
+    # Update persistence counters
+    if rocket >= _stability_entry_threshold:
+        _stability_consecutive_rocket += 1
+    else:
+        _stability_consecutive_rocket = 0
+
+    if waterfall >= _stability_entry_threshold:
+        _stability_consecutive_waterfall += 1
+    else:
+        _stability_consecutive_waterfall = 0
+
+    # Check if market is in chop (tight range)
+    in_tight_range = _last_main_sr_gap < _stability_min_sr_gap
+
+    # Rocket entry check
+    rocket_entry_ok = (
+        _stability_consecutive_rocket >= _stability_required_ticks
+        and waterfall <= _stability_opposing_max
+        and not in_tight_range
+    )
+    # Waterfall entry check
+    waterfall_entry_ok = (
+        _stability_consecutive_waterfall >= _stability_required_ticks
+        and rocket <= _stability_opposing_max
+        and not in_tight_range
+    )
+
+    if rocket_entry_ok:
         signal = "ROCKET"
         entry  = round(price, 2)
         tp1    = round(price + atr * 1.2, 2)
         tp2    = round(price + atr * 2.0, 2)
         sl     = round(price - atr * 0.8, 2)
-    elif waterfall >= _RW_ENTRY_THRESHOLD:
+    elif waterfall_entry_ok:
         signal = "WATERFALL"
         entry  = round(price, 2)
         tp1    = round(price - atr * 1.2, 2)
         tp2    = round(price - atr * 2.0, 2)
         sl     = round(price + atr * 0.8, 2)
     # ── PHASE 31: Predictive signals (ML first, then slope, then building) ──
-    elif b4.get("b4_signal") == "ROCKET_PREDICTED":
-        signal = "ROCKET_PREDICTED"   # Brain 4 ML says rocket coming in next 3min
+    elif b4.get("b4_signal") == "ROCKET_PREDICTED" and not in_tight_range:
+        signal = "ROCKET_PREDICTED"
         entry = tp1 = tp2 = sl = 0
-    elif b4.get("b4_signal") == "WATERFALL_PREDICTED":
+    elif b4.get("b4_signal") == "WATERFALL_PREDICTED" and not in_tight_range:
         signal = "WATERFALL_PREDICTED"
         entry = tp1 = tp2 = sl = 0
-    elif imminent == "ROCKET_IMMINENT":
-        signal = "ROCKET_IMMINENT"    # Slope says rocket <2min away
+    elif imminent == "ROCKET_IMMINENT" and not in_tight_range:
+        signal = "ROCKET_IMMINENT"
         entry = tp1 = tp2 = sl = 0
-    elif imminent == "WATERFALL_IMMINENT":
+    elif imminent == "WATERFALL_IMMINENT" and not in_tight_range:
         signal = "WATERFALL_IMMINENT"
         entry = tp1 = tp2 = sl = 0
-    elif rocket >= _RW_PRE_THRESHOLD:
+    elif rocket >= _RW_PRE_THRESHOLD and not in_tight_range:
         signal = "ROCKET_BUILDING"
         entry = tp1 = tp2 = sl = 0
-    elif waterfall >= _RW_PRE_THRESHOLD:
+    elif waterfall >= _RW_PRE_THRESHOLD and not in_tight_range:
         signal = "WATERFALL_BUILDING"
+        entry = tp1 = tp2 = sl = 0
+    elif in_tight_range:
+        # Explicitly show why we're blocking — useful for dashboard
+        signal = "TIGHT_RANGE"
         entry = tp1 = tp2 = sl = 0
     else:
         signal = "WAIT"
@@ -1437,4 +1500,11 @@ def run_rocket_analysis(live_price=None):
         "b4_waterfall_prob": b4.get("b4_waterfall_prob", 0.0),
         "b4_signal":         b4.get("b4_signal"),
         "b4_loaded":         b4.get("b4_loaded", False),
+        # ── PHASE 31b: Stability gate visibility ────────────────────────
+        "stability_rocket_streak":    _stability_consecutive_rocket,
+        "stability_waterfall_streak": _stability_consecutive_waterfall,
+        "stability_required":         _stability_required_ticks,
+        "stability_threshold":        _stability_entry_threshold,
+        "in_tight_range":             in_tight_range,
+        "main_sr_gap":                round(_last_main_sr_gap, 2),
     }
