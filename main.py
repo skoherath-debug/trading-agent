@@ -425,6 +425,13 @@ def entry_analysis_ep():
     except Exception as e:
         return {"error": str(e)}
 
+@api.get("/rocket-status")
+def rocket_ep():
+    """Phase 30 — latest Rocket/Waterfall micro-entry status."""
+    return JSONResponse(content=clean(_rw_result) if _rw_result else {
+        "rocket":0,"waterfall":0,"signal":"WAIT","msg":"No scan yet — starts 07:00 UTC"
+    })
+
 @api.get("/files")
 def files_ep():
     files = {}
@@ -653,6 +660,97 @@ def scheduler():
 
         time.sleep(PHASE_A_SECS)  # always 2.5min between cycles
 
+
+# ── Phase 30: Rocket/Waterfall fast scheduler (60s) ──────────────────────────
+def rocket_scheduler():
+    global _rw_result, _rw_pre_alerted, _rw_entry_alerted
+    global _rw_alert_dir, _rw_alert_ts, _rw_alert_price
+    import time as _t
+    _t.sleep(30)  # stagger from main scheduler
+    print("[RW] Phase 30 Rocket/Waterfall scheduler started")
+    while True:
+        try:
+            # Get live price from cache
+            live_p = _price_cache.get("price")
+            result = run_rocket_analysis(live_p)
+            _rw_result = result
+
+            rocket    = result.get("rocket", 0)
+            waterfall = result.get("waterfall", 0)
+            signal    = result.get("signal", "WAIT")
+            price     = result.get("price", 0)
+            rsi       = result.get("rsi", 50)
+            atr       = result.get("atr", 13)
+            entry     = result.get("entry", price)
+            tp1       = result.get("tp1", 0)
+            tp2       = result.get("tp2", 0)
+            sl        = result.get("sl", 0)
+            now_s     = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+            print(f"[RW] 🚀{rocket} 💧{waterfall} | {signal} | ${sf(price)} | RSI={sf(rsi,1)}")
+
+            now_ts = _t.time()
+            cooldown_ok = (now_ts - _rw_alert_ts) >= _RW_COOLDOWN
+            dir_flip    = (signal in ("ROCKET","WATERFALL") and
+                           signal.split("_")[0] != _rw_alert_dir.split("_")[0])
+
+            # ── PRE-ALERT: Rocket/Waterfall building (40+) ──────────────────
+            if signal in ("ROCKET_BUILDING","WATERFALL_BUILDING") and not _rw_pre_alerted:
+                emoji = "🚀" if "ROCKET" in signal else "💧"
+                score = rocket if "ROCKET" in signal else waterfall
+                mom_str = "🚀 Rocket: " if "ROCKET" in signal else "💧 Waterfall: "
+                tg(emoji + " MOMENTUM BUILDING — XAU/USD\n"
+                   + "━━━━━━━━━━━━━━━━━━━━\n"
+                   + mom_str + str(score) + "/100\n"
+                   + "Price: $" + sf(price) + "\n"
+                   + "RSI: " + sf(rsi,1) + "\n"
+                   + "━━━━━━━━━━━━━━━━━━━━\n"
+                   + "GET READY — Signal building\n"
+                   + "Watch for ENTRY ALERT\n"
+                   + now_s + " | agent.ceylonpropertylink.com")
+                _rw_pre_alerted = True
+                print(f"[RW] Pre-alert sent: {signal} {score}/100")
+
+            # ── ENTRY ALERT: Full entry signal (60+) ────────────────────────
+            elif signal in ("ROCKET","WATERFALL") and (cooldown_ok or dir_flip):
+                emoji    = "⚡🚀" if signal == "ROCKET" else "⚡💧"
+                dir_word = "BUY" if signal == "ROCKET" else "SELL"
+                score    = rocket if signal == "ROCKET" else waterfall
+                max_slip = round(atr * 0.15, 2)
+                rr       = round(abs(tp1-entry)/abs(sl-entry),1) if abs(sl-entry)>0 else 0
+
+                mom_str2 = "🚀 Rocket: " if signal=="ROCKET" else "💧 Waterfall: "
+                tg(emoji + " " + dir_word + " NOW — XAU/USD\n"
+                   + "━━━━━━━━━━━━━━━━━━━━\n"
+                   + mom_str2 + str(score) + "/100  RSI: " + sf(rsi,1) + "\n"
+                   + "━━━━━━━━━━━━━━━━━━━━\n"
+                   + "Entry: $" + sf(entry) + "  (+-$" + sf(max_slip) + ")\n"
+                   + "TP1  : $" + sf(tp1) + "  (+" + sf(abs(tp1-entry)) + ")\n"
+                   + "TP2  : $" + sf(tp2) + "  (+" + sf(abs(tp2-entry)) + ")\n"
+                   + "SL   : $" + sf(sl) + "  (-" + sf(abs(sl-entry)) + ")\n"
+                   + "━━━━━━━━━━━━━━━━━━━━\n"
+                   + "RR: 1:" + sf(rr,1) + "  ATR: $" + sf(atr) + "\n"
+                   + "Skip if price moved >$" + sf(max_slip) + "\n"
+                   + now_s + " | Phase 30 | agent.ceylonpropertylink.com")
+                _rw_alert_dir   = signal
+                _rw_alert_ts    = now_ts
+                _rw_alert_price = price
+                _rw_entry_alerted = True
+                _rw_pre_alerted   = False  # reset for next setup
+                print(f"[RW] ENTRY ALERT sent: {dir_word} ${sf(price)} Rocket={rocket} WF={waterfall}")
+
+            # Reset pre-alert when momentum fades
+            if signal == "WAIT" and _rw_pre_alerted:
+                _rw_pre_alerted   = False
+                _rw_entry_alerted = False
+
+        except Exception as e:
+            print(f"[RW] Scheduler error: {str(e)[:100]}")
+
+        _t.sleep(60)  # run every 60 seconds
+
+threading.Thread(target=rocket_scheduler, daemon=True).start()
+print("[RW] Phase 30 Rocket/Waterfall scheduler started — 60s interval")
 
 threading.Thread(target=scheduler, daemon=True).start()
 print("Scheduler started - 2min trading / 30min off-hours · Phase 29")
