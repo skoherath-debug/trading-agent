@@ -1,1138 +1,867 @@
 """
-trading_agent.py — Phase 30 (PATCHED 2026-04-17)
+main.py — Phase 30 (PATCHED 2026-04-17)
 
 Fixes in this build:
-  [FIX-1] Removed broken Rocket/Waterfall gate that referenced `sig` before definition
-          — this was a NameError bomb every time fused >= 6.3
-  [FIX-2] Consolidated three duplicate gate blocks into ONE (after sig is set)
-  [FIX-3] Added `global _td_key_index` so the key rotation actually persists
-  [FIX-4] b2_dir now handles BUY / SELL / WAIT cleanly (was BUY/WAIT only)
-  [ADD-1] Switched Phase 30 to 1-minute bars (was 5min) for faster rocket detection
-  [ADD-2] Exposed _RW_COOLDOWN / _rw_alert_ts / _rw_entry_alerted / _rw_result aliases
-          so main.py's name mismatches don't crash the rocket scheduler
-  [ADD-3] rocket-status returns signal_time so frontend can show signal age
+  [FIX-A] Added defensive module-level _rw_result = None init (was NameError
+          on /rocket-status endpoint before first scheduler tick)
+  [FIX-B] _pre_signal now correctly produces BUY / SELL / WAIT (was BUY/WAIT only)
+  [FIX-C] rocket_scheduler now uses canonical names from trading_agent.py:
+          _rw_alert_time (not _rw_alert_ts), _RW_ENTRY_COOLDOWN (not _RW_COOLDOWN),
+          _rw_alerted (not _rw_entry_alerted). Prevents NameError on first iteration.
+  [FIX-D] mins_since debug output now computed BEFORE timestamp reset (was always 0)
+  [ADD-A] Added simple heartbeat endpoint & improved /status fallback messaging
 """
 
-import os, pickle, json, requests, pandas as pd, numpy as np, yfinance as yf
-from datetime import datetime, timezone, time as _time
+import os, threading, time, traceback
+import numpy as np
+import pandas as pd
+import requests as req
+from datetime import datetime, timezone
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-# ── Env vars ──────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8172828888:AAFWCvtCl1F-Kj5yOv_EFEB9vxL-ir-dD9I")
-TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT",  "7132630179")
+# ── Phase 28/29: Improvements ─────────────────────────────────
+try:
+    from api_improvements import router as improvements_router
+    from performance_tracker import tracker
+    from improvements import (
+        get_adaptive_thresholds,
+        detect_market_condition,
+        is_news_event_soon,
+        calculate_position_size,
+        get_volatility_risk_level,
+        apply_trailing_stop,
+        get_session_name,
+        is_trading_allowed,
+    )
+    IMPROVEMENTS_LOADED = True
+    print("✅ Phase 28/29 improvements loaded")
+except Exception as e:
+    IMPROVEMENTS_LOADED = False
+    print(f"⚠️  Improvements not available: {e}")
 
-_GROQ_KEYS = [k for k in [
-    os.environ.get("GROQ_API_KEY",  "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"),
-    os.environ.get("GROQ_API_KEY2", "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"),
-    os.environ.get("GROQ_API_KEY3", "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"),
-] if k.strip()]
-_groq_key_index = 0
-GROQ_API_KEY = _GROQ_KEYS[0]
+# ── App ───────────────────────────────────────────────────────
+api = FastAPI(title="XAU/USD Triple Brain Agent · Phase 30")
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+if IMPROVEMENTS_LOADED:
+    api.include_router(improvements_router)
 
-_TD_KEYS = [k for k in [
-    os.environ.get("TD_KEY",  "f3883b7831a540cda02cfafcfe77e082"),
-    os.environ.get("TD_KEY2", "41c8cfdf490b4bf4a0d388e716a32453"),
-    os.environ.get("TD_KEY3", "f58b0a482f1443e78fb23cf8975b44d9"),
-] if k.strip()]
-_td_key_index = 0
+# ── Env ───────────────────────────────────────────────────────
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT",  "")
+RUN_INTERVAL   = int(os.environ.get("RUN_INTERVAL", "300"))
+PKL_ID         = os.environ.get("MODEL_PKL_ID",  "")
+JSON_ID        = os.environ.get("MODEL_JSON_ID", "")
+TPSL_ID        = os.environ.get("TPSL_JSON_ID",  "")
+TD_KEY         = os.environ.get("TD_KEY",         "")
+BRAIN4_PKL_ID  = os.environ.get("BRAIN4_PKL_ID",  "")   # Google Drive file ID
+BRAIN4_JSON_ID = os.environ.get("BRAIN4_JSON_ID", "")   # Google Drive file ID
+MODELS_DIR     = "/app/models"
+os.makedirs(MODELS_DIR, exist_ok=True)
 
-def get_td_key():
-    global _td_key_index
-    if not _TD_KEYS: return ""
-    return _TD_KEYS[_td_key_index % len(_TD_KEYS)]
+# [FIX-A] DEFENSIVE INIT — will be overridden when trading_agent.py exec's,
+# but prevents NameError if /rocket-status is called before first scheduler tick.
+_rw_result        = None
+_rw_pre_alerted   = False
+_rw_alerted       = False
+_rw_alert_dir     = "WAIT"
+_rw_alert_time    = 0.0
+_rw_alert_price   = 0.0
+_RW_ENTRY_COOLDOWN= 600
 
-def rotate_td_key(reason=""):
-    global _td_key_index
-    if len(_TD_KEYS) <= 1: return
-    _td_key_index += 1
-    print(f"[TD KEY] Rotated to key {(_td_key_index % len(_TD_KEYS)) + 1}/{len(_TD_KEYS)} — {reason}")
+_atr_history  = []
+_volatility_ma = 15.0
 
-TD_KEY = get_td_key()
+# ── Safe helpers ──────────────────────────────────────────────
+def sf(v, d=2):
+    try:
+        if v is None: return "0.00"
+        f = float(v)
+        if f != f: return "0.00"
+        return "{:.{}f}".format(f, d)
+    except Exception: return "0.00"
 
-GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama3-70b-8192",
-    "gemma2-9b-it",
-    "llama3-8b-8192",
-    "mixtral-8x7b-32768",
-]
-_groq_model_index = 0
-GROQ_MODEL = GROQ_MODELS[0]
-SYMBOL = "GC=F"
+def sn(v, fallback=0):
+    try:
+        if v is None: return fallback
+        f = float(v)
+        return fallback if f != f else f
+    except Exception: return fallback
 
-def _to_python(obj):
-    if isinstance(obj, dict):          return {k: _to_python(v) for k, v in obj.items()}
-    if isinstance(obj, list):          return [_to_python(v) for v in obj]
-    if isinstance(obj, np.integer):    return int(obj)
-    if isinstance(obj, np.floating):   return float(obj)
-    if isinstance(obj, np.ndarray):    return obj.tolist()
-    if isinstance(obj, np.bool_):      return bool(obj)
+# ── Expert Entry Analysis ────────────────────────────────────
+def get_entry_analysis(result, current_price):
+    sig    = result.get("signal","WAIT")
+    sig_px = sn(result.get("price"), 0)
+    atr    = sn(result.get("atr"), 13)
+    tp1    = sn(result.get("tp"),  0)
+    sl     = sn(result.get("sl"),  0)
+    h4     = result.get("h4") or {}
+    ema20  = sn(h4.get("ema20"), 0)
+
+    if sig not in ("BUY","SELL") or sig_px == 0:
+        return None
+
+    zone_size   = round(atr * 0.4, 2)
+    zone_low    = round(sig_px - zone_size, 2)
+    zone_high   = round(sig_px + zone_size, 2)
+    limit_offset = round(atr * 0.2, 2)
+    if sig == "BUY":
+        limit_price = round(sig_px - limit_offset, 2)
+        in_zone     = zone_low <= current_price <= zone_high
+        price_ok    = current_price <= sig_px + zone_size
+        confirm_lvl = round(max(sig_px, ema20) + 0.5, 2) if ema20 else sig_px
+    else:
+        limit_price = round(sig_px + limit_offset, 2)
+        in_zone     = zone_low <= current_price <= zone_high
+        price_ok    = current_price >= sig_px - zone_size
+        confirm_lvl = round(min(sig_px, ema20) - 0.5, 2) if ema20 else sig_px
+
+    slippage    = round(abs(current_price - sig_px), 2)
+    slippage_pct= round(slippage / atr * 100, 1)
+
+    if slippage <= atr * 0.1:    quality = 10
+    elif slippage <= atr * 0.2:  quality = 8
+    elif slippage <= atr * 0.4:  quality = 6
+    elif slippage <= atr * 0.6:  quality = 4
+    else:                         quality = 0
+
+    rr_raw = abs(tp1-sig_px)/abs(sl-sig_px) if abs(sl-sig_px) > 0 else 0
+    adj_tp1 = round(current_price + abs(tp1-sig_px), 2) if sig=="BUY" else round(current_price - abs(tp1-sig_px), 2)
+    adj_sl  = round(current_price - abs(sl-sig_px),  2) if sig=="BUY" else round(current_price + abs(sl-sig_px),  2)
+
+    return {
+        "signal":       sig,
+        "signal_price": sig_px,
+        "current_price":current_price,
+        "slippage":     slippage,
+        "slippage_pct": slippage_pct,
+        "in_zone":      in_zone,
+        "price_ok":     price_ok,
+        "quality":      quality,
+        "zone_low":     zone_low,
+        "zone_high":    zone_high,
+        "limit_price":  limit_price,
+        "limit_offset": limit_offset,
+        "confirm_level":confirm_lvl,
+        "adj_tp1":      adj_tp1,
+        "adj_sl":       adj_sl,
+        "atr":          atr,
+    }
+
+def clean(obj):
+    if isinstance(obj, dict):   return {k: clean(v) for k, v in obj.items()}
+    if isinstance(obj, list):   return [clean(v) for v in obj]
+    if isinstance(obj, np.integer):  return int(obj)
+    if isinstance(obj, np.floating): return float(obj)
+    if isinstance(obj, np.ndarray):  return obj.tolist()
+    if isinstance(obj, np.bool_):    return bool(obj)
+    if isinstance(obj, float) and obj != obj: return None
     return obj
 
-def calculate_atr_dynamic(df, period=14):
-    h, l, c = df["high"], df["low"], df["close"]
-    tr = pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-
-def get_dynamic_tpsl(df, direction, entry_price):
+# ── Download models ───────────────────────────────────────────
+def download_file(file_id, dest):
+    if os.path.exists(dest):
+        fsize = os.path.getsize(dest)
+        if dest.endswith(".pkl") and fsize < 5000:
+            print(f"CORRUPT: {os.path.basename(dest)} only {fsize} bytes — re-downloading")
+            os.remove(dest)
+        else:
+            print("EXISTS: " + os.path.basename(dest) + " (" + str(fsize) + " bytes)")
+            return True
+    if not file_id or "PASTE" in file_id:
+        print("NO ID: " + os.path.basename(dest))
+        return False
     try:
-        with open("dynamic_tpsl_config.json") as f:
-            cfg = json.load(f)
-    except Exception:
-        return 15.0, 10.0, entry_price + 5, entry_price - 3.33
-    atr_val = float(calculate_atr_dynamic(df, cfg["atr_period"]).iloc[-1])
-    if pd.isna(atr_val): atr_val = 16.78
-    tp_pts = atr_val * cfg["tp_atr_mult"]
-    sl_pts = atr_val * cfg["sl_atr_mult"]
-    px     = cfg["px_to_usd"]
-    tp_usd = round(min(max(tp_pts * px, cfg["tp_clamp"][0]), cfg["tp_clamp"][1]), 2)
-    sl_usd = round(min(max(sl_pts * px, cfg["sl_clamp"][0]), cfg["sl_clamp"][1]), 2)
-    if direction == "BUY":
-        tp_level = round(entry_price + tp_pts, 2)
-        sl_level = round(entry_price - sl_pts, 2)
-    else:
-        tp_level = round(entry_price - tp_pts, 2)
-        sl_level = round(entry_price + sl_pts, 2)
-    return tp_usd, sl_usd, tp_level, sl_level
-
-_BLOCK_START = _time(21, 0)
-_BLOCK_END   = _time(1,  0)
-
-def _is_session_blocked(utc_dt=None):
-    if utc_dt is None: utc_dt = datetime.now(timezone.utc)
-    t = utc_dt.time().replace(second=0, microsecond=0)
-    return t >= _BLOCK_START or t < _BLOCK_END
-
-def _get_session_quality(utc_dt=None):
-    if utc_dt is None: utc_dt = datetime.now(timezone.utc)
-    if _is_session_blocked(utc_dt): return "BLOCKED", False
-    h = utc_dt.hour
-    london   = 7  <= h < 16
-    new_york = 13 <= h < 21
-    if london and new_york: return "HIGH (London/NY overlap)", True
-    elif london or new_york: return "MEDIUM", True
-    else: return "LOW (no major session)", False
-
-def _get_h4_trend(df_h1):
-    try:
-        df = df_h1.copy()
-        df.index = pd.to_datetime(df.index)
-        if df.index.tz is not None: df.index = df.index.tz_localize(None)
-        h4 = df.resample("4h").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
-        if len(h4) < 55:
-            return {"direction":"NEUTRAL","reason":"insufficient H4 data","score":5,
-                    "ema20":None,"ema50":None,"rsi":None,"atr":None}
-        c = h4["close"]
-        ema20 = c.ewm(span=20, adjust=False).mean()
-        ema50 = c.ewm(span=50, adjust=False).mean()
-        delta = c.diff()
-        gain  = delta.clip(lower=0).rolling(14).mean()
-        loss  = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi   = (100 - 100 / (1 + gain / (loss + 1e-9))).iloc[-1]
-        tr    = pd.concat([h4["high"]-h4["low"],(h4["high"]-h4["close"].shift()).abs(),(h4["low"]-h4["close"].shift()).abs()],axis=1).max(axis=1)
-        atr   = tr.rolling(14).mean().iloc[-1]
-        price = c.iloc[-1]; e20 = ema20.iloc[-1]; e50 = ema50.iloc[-1]; e20_p = ema20.iloc[-2]
-        bull_pts = sum([price > e20, e20 > e50, e20 > e20_p, rsi > 50])
-        if bull_pts >= 3:   direction, score, reason = "BUY",  8 if bull_pts==4 else 7, f"H4 bullish ({bull_pts}/4 conditions)"
-        elif bull_pts <= 1: direction, score, reason = "SELL", 2 if bull_pts==0 else 3, f"H4 bearish ({bull_pts}/4 conditions)"
-        else:               direction, score, reason = "NEUTRAL", 5, f"H4 neutral ({bull_pts}/4 conditions)"
-        return {"direction":direction,"score":score,"reason":reason,
-                "ema20":round(e20,2),"ema50":round(e50,2),"rsi":round(rsi,2),
-                "atr":round(atr,2),"bull_pts":bull_pts,"candles":len(h4)}
-    except Exception as e:
-        return {"direction":"NEUTRAL","reason":f"H4 error: {e}","score":5,
-                "ema20":None,"ema50":None,"rsi":None,"atr":None}
-
-_DAILY_PNL_PATH    = "daily_pnl.json"
-_DAILY_LOSS_LIMIT  = 30.0
-_MAX_TRADES_PER_DAY = 6
-
-def _load_daily_pnl():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    try:
-        with open(_DAILY_PNL_PATH) as f: data = json.load(f)
-        if data.get("date") != today: raise ValueError("stale")
-        return data
-    except Exception:
-        return {"date": today, "trades": [], "total_pnl": 0.0, "trade_count": 0}
-
-def _save_daily_pnl(data):
-    try:
-        with open(_DAILY_PNL_PATH, "w") as f: json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"[DAILY PNL] Save error: {e}")
-
-def _check_daily_limit():
-    pnl        = _load_daily_pnl()
-    total_loss = abs(min(pnl["total_pnl"], 0))
-    count      = pnl["trade_count"]
-    if total_loss >= _DAILY_LOSS_LIMIT:
-        return True, f"Daily loss limit hit (${total_loss:.2f}/${_DAILY_LOSS_LIMIT})", pnl
-    if count >= _MAX_TRADES_PER_DAY:
-        return True, f"Max trades reached ({count}/{_MAX_TRADES_PER_DAY})", pnl
-    return False, f"OK — loss=${total_loss:.2f}/${_DAILY_LOSS_LIMIT} | trades={count}/{_MAX_TRADES_PER_DAY}", pnl
-
-def record_trade_result(signal, entry, exit_price, lot=0.03, px_to_usd=3.0):
-    pts     = (exit_price - entry) if signal == "BUY" else (entry - exit_price)
-    pnl_usd = round(pts * px_to_usd, 2)
-    pnl_data = _load_daily_pnl()
-    pnl_data["trades"].append({"time":datetime.now(timezone.utc).isoformat(),
-                                "signal":signal,"entry":entry,"exit":exit_price,"pnl":pnl_usd})
-    pnl_data["total_pnl"]    = round(pnl_data["total_pnl"] + pnl_usd, 2)
-    pnl_data["trade_count"] += 1
-    _save_daily_pnl(pnl_data)
-    icon = "✅" if pnl_usd >= 0 else "❌"
-    print(f"[TRADE RESULT] {icon} {signal} P&L=${pnl_usd:+.2f} | Day total=${pnl_data['total_pnl']:+.2f}")
-    return pnl_data
-
-def get_daily_summary():
-    pnl = _load_daily_pnl()
-    blocked, reason, _ = _check_daily_limit()
-    wins   = sum(1 for t in pnl["trades"] if t["pnl"] > 0)
-    losses = sum(1 for t in pnl["trades"] if t["pnl"] < 0)
-    return {"date":pnl["date"],"total_pnl":pnl["total_pnl"],"trade_count":pnl["trade_count"],
-            "wins":wins,"losses":losses,"win_rate":round(wins/max(pnl["trade_count"],1)*100,1),
-            "limit_usd":_DAILY_LOSS_LIMIT,"max_trades":_MAX_TRADES_PER_DAY,
-            "blocked":blocked,"status":reason,"trades":pnl["trades"]}
-
-_sr_flip_state = {"last_support": None, "alerted": False}
-
-def check_sr_flip(price, support, resistance, atr):
-    prev = _sr_flip_state["last_support"]
-    if prev is not None and abs(support - prev) > 1.0:
-        _sr_flip_state["alerted"] = False
-    _sr_flip_state["last_support"] = support
-    if price < support and not _sr_flip_state["alerted"]:
-        _sr_flip_state["alerted"] = True
-        msg = (
-            f"⚠️ S/R FLIP ALERT\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Support ${support:.2f} broken\n"
-            f"Now acting as RESISTANCE\n"
-            f"Price  : ${price:.2f}\n"
-            f"New est support: ~${support - atr:.2f}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⛔ Avoid BUY until price reclaims ${support:.2f}"
-        )
+        print("DOWNLOADING: " + os.path.basename(dest))
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT, "text": msg},
-                timeout=10
-            )
-            print(f"🚨 S/R flip alert sent — ${support:.2f} broken")
-        except Exception as e:
-            print(f"[SR FLIP] Telegram error: {e}")
+            import gdown
+            gdown.download(f"https://drive.google.com/uc?id={file_id}", dest, quiet=False)
+            if os.path.exists(dest) and os.path.getsize(dest) > 5000:
+                print("OK (gdown): " + os.path.basename(dest))
+                return True
+            elif os.path.exists(dest):
+                os.remove(dest)
+        except Exception as ge:
+            print(f"gdown failed: {ge}")
+        url = "https://drive.google.com/uc?export=download&id=" + file_id
+        session = req.Session()
+        r = session.get(url, stream=True, timeout=60)
+        for k, v in r.cookies.items():
+            if k.startswith("download_warning"):
+                r = session.get(url + "&confirm=" + v, stream=True, timeout=60)
+                break
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(32768):
+                if chunk: f.write(chunk)
+        fsize = os.path.getsize(dest)
+        if fsize < 5000 and dest.endswith(".pkl"):
+            with open(dest, "rb") as f:
+                header = f.read(20)
+            if b"<!DOCTYPE" in header or b"<html" in header:
+                print("ERROR: Got HTML instead of model")
+                os.remove(dest)
+                return False
+        print("OK: " + os.path.basename(dest) + " (" + str(fsize) + " bytes)")
+        return True
+    except Exception as e:
+        print("FAILED: " + str(e))
+        if os.path.exists(dest): os.remove(dest)
+        return False
 
-class Brain2Analyzer:
-    def analyze_trend(self, df):
-        close=df["close"]; ema20=close.ewm(span=20,adjust=False).mean().iloc[-1]
-        ema50=close.ewm(span=50,adjust=False).mean().iloc[-1]
-        ema200=close.ewm(span=200,adjust=False).mean().iloc[-1]; price=close.iloc[-1]
-        bs=sum([price>ema20,ema20>ema50,ema50>ema200])
-        if bs>=3: d,s="BULLISH","STRONG" if bs==3 else "MODERATE"
-        elif bs==0: d,s="BEARISH","STRONG"
-        elif bs==1: d,s="BEARISH","MODERATE"
-        else: d,s="NEUTRAL","CHOPPY"
-        return {"direction":d,"strength":s,"ema20":round(ema20,2),"ema50":round(ema50,2),
-                "ema200":round(ema200,2),"score":(bs/3)*10}
+download_file(PKL_ID,  MODELS_DIR + "/brain1_xgboost_v4.pkl")
+download_file(JSON_ID, MODELS_DIR + "/brain1_features_v4.json")
+download_file(TPSL_ID, MODELS_DIR + "/dynamic_tpsl_config.json")
 
-    def analyze_structure(self, df, lookback=20):
-        highs=df["high"].values[-lookback:]; lows=df["low"].values[-lookback:]
-        sh=[highs[i] for i in range(1,len(highs)-1) if highs[i]>highs[i-1] and highs[i]>highs[i+1]]
-        sl=[lows[i]  for i in range(1,len(lows)-1)  if lows[i]<lows[i-1]  and lows[i]<lows[i+1]]
-        structure,bos="RANGING",False
-        if len(sh)>=2 and len(sl)>=2:
-            if sh[-1]>sh[-2] and sl[-1]>sl[-2]: structure="UPTREND"
-            elif sh[-1]<sh[-2] and sl[-1]<sl[-2]: structure="DOWNTREND"
-            else: structure,bos="CHOPPY",True
-        return {"structure":structure,"break_of_structure":bos,
-                "swing_highs":[round(h,2) for h in sh[-3:]],"swing_lows":[round(l,2) for l in sl[-3:]],
-                "score":8 if structure=="UPTREND" else 2 if structure=="DOWNTREND" else 5}
+# [PHASE 31] Brain 4 — Rocket predictor (optional; slope works without it)
+download_file(BRAIN4_PKL_ID,  MODELS_DIR + "/brain4_rocket_pred.pkl")
+download_file(BRAIN4_JSON_ID, MODELS_DIR + "/brain4_features.json")
 
-    def analyze_session(self, df):
-        hour=datetime.now(timezone.utc).hour; active=[]
-        if 7<=hour<16: active.append("LONDON")
-        if 13<=hour<22: active.append("NEW_YORK")
-        if 0<=hour<8:  active.append("ASIA")
-        overlap=len(active)>1
-        rr=(df["high"]-df["low"]).iloc[-1]; ar=(df["high"]-df["low"]).iloc[-20:].mean()
-        return {"active_sessions":active,"overlap":overlap,
-                "liquidity":"HIGH" if overlap else "MEDIUM" if active else "LOW",
-                "candle_range_ratio":round(rr/ar if ar>0 else 1.0,2),
-                "score":8 if overlap else 5 if active else 3}
+# ── Load trading_agent.py ─────────────────────────────────────
+_agent_loaded = False
+try:
+    code = open("/app/trading_agent.py").read()
+    code = code.replace('"/content/drive/MyDrive/trading_agent/', '"' + MODELS_DIR + '/')
+    exec(code, globals())
+    _agent_loaded = True
+    print("trading_agent.py loaded OK")
+except Exception as e:
+    print("trading_agent.py FAILED: " + str(e))
+    traceback.print_exc()
 
-    def analyze_momentum(self, df):
-        close=df["close"]; delta=close.diff()
-        gain=delta.clip(lower=0).rolling(14).mean(); loss=(-delta.clip(upper=0)).rolling(14).mean()
-        rsi=(100-(100/(1+gain/(loss+1e-9)))).iloc[-1]
-        macd=(close.ewm(span=12,adjust=False).mean()-close.ewm(span=26,adjust=False).mean())
-        hist=(macd-macd.ewm(span=9,adjust=False).mean())
-        hist_now=hist.iloc[-1]; hist_prev=hist.iloc[-2]
-        mc="BULLISH" if hist_now>0 else "BEARISH"
-        rsi_series = 100-(100/(1+gain/(loss+1e-9)))
-        rsi_slope = rsi_series.iloc[-1] - rsi_series.iloc[-5]
-        if rsi>70: state="OVERBOUGHT"
-        elif rsi<30: state="OVERSOLD"
-        elif rsi>55 and mc=="BULLISH": state="BULLISH_MOMENTUM"
-        elif rsi<45 and mc=="BEARISH": state="BEARISH_MOMENTUM"
-        else: state="NEUTRAL"
-
-        rocket = 0
-        ema9  = close.ewm(span=9, adjust=False).mean()
-        ema21 = close.ewm(span=21, adjust=False).mean()
-        price = close.iloc[-1]
-        if rsi < 35: rocket += 25
-        elif rsi < 45 and rsi_slope > 2: rocket += 15
-        if hist_now > 0 and hist_now > hist_prev: rocket += 20
-        if price > ema9.iloc[-1]: rocket += 15
-        if ema9.iloc[-1] > ema21.iloc[-1]: rocket += 15
-        if rsi_slope > 3: rocket += 15
-        rocket = min(rocket, 100)
-        waterfall = 0
-        if rsi > 65: waterfall += 25
-        elif rsi > 55 and rsi_slope < -2: waterfall += 15
-        if hist_now < 0 and hist_now < hist_prev: waterfall += 20
-        if price < ema9.iloc[-1]: waterfall += 15
-        if ema9.iloc[-1] < ema21.iloc[-1]: waterfall += 15
-        if rsi_slope < -3: waterfall += 15
-        waterfall = min(waterfall, 100)
-
-        if rocket >= 60:   score = 8
-        elif rocket >= 40: score = 7
-        elif waterfall >= 60: score = 2
-        elif waterfall >= 40: score = 3
-        elif state=="NEUTRAL": score = 5
-        elif state=="OVERBOUGHT": score = 3
-        else: score = 7
-        return {"rsi":round(rsi,2),"macd_histogram":round(hist_now,4),"macd_cross":mc,
-                "state":state,"rsi_slope":round(rsi_slope,2),
-                "rocket_score":rocket,"waterfall_score":waterfall,
-                "divergence_detected":False,"score":score}
-
-    def analyze_volatility(self, df):
-        h,l,c=df["high"],df["low"],df["close"]
-        tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
-        atr=tr.rolling(14).mean().iloc[-1]; avg=tr.rolling(14).mean().iloc[-50:-1].mean()
-        r=atr/avg if avg>0 else 1.0
-        s="HIGH_VOLATILITY" if r>1.5 else "LOW_VOLATILITY" if r<0.7 else "NORMAL"
-        return {"atr14":round(float(atr),4),"atr_ratio":round(float(r),2),"state":s,
-                "suggested_sl_pips":round(float(atr),2),"suggested_tp_pips":round(float(atr*1.5),2),
-                "score":7 if s=="NORMAL" else 4 if s=="HIGH_VOLATILITY" else 5}
-
-    def analyze_sr_zones(self, df, lookback=50):
-        highs=df["high"].values[-lookback:]; lows=df["low"].values[-lookback:]
-        price=float(df["close"].iloc[-1])
-        all_levels=sorted(set(
-            [float(h) for i,h in enumerate(highs) if h==max(highs[max(0,i-3):i+4])]+
-            [float(l) for i,l in enumerate(lows)  if l==min(lows[max(0,i-3):i+4])]))
-        rs=[x for x in all_levels if x>price]; ss=[x for x in all_levels if x<price]
-        nr=min(rs) if rs else price*1.01; ns=max(ss) if ss else price*0.99
-        return {"nearest_resistance":round(nr,2),"nearest_support":round(ns,2),
-                "dist_to_resistance_pct":round((nr-price)/price*100,3),
-                "dist_to_support_pct":round((price-ns)/price*100,3),
-                "at_key_zone":min((nr-price)/price*100,(price-ns)/price*100)<0.15,"score":5}
-
-    def score_confluence(self, t, st, se, m, v):
-        scores=[t["score"],st["score"],se["score"],m["score"],v["score"]]
-        avg=sum(scores)/len(scores)
-        if avg>=6.5: sig,conf="BUY","HIGH" if avg>=8 else "MEDIUM"
-        elif avg<=3.5: sig,conf="SELL","HIGH" if avg<=2 else "MEDIUM"
-        else: sig,conf="WAIT","LOW"
-        return {"signal":sig,"confidence":conf,"confluence_score":round(avg,2),
-                "module_scores":{"trend":t["score"],"structure":st["score"],
-                "session":se["score"],"momentum":m["score"],"volatility":v["score"]}}
-
-    def analyze(self, df):
-        t=self.analyze_trend(df); st=self.analyze_structure(df)
-        se=self.analyze_session(df); m=self.analyze_momentum(df)
-        v=self.analyze_volatility(df); sr=self.analyze_sr_zones(df)
-        c=self.score_confluence(t,st,se,m,v)
-        return {"timestamp":datetime.now(timezone.utc).isoformat(),
-                "price":round(float(df["close"].iloc[-1]),2),
-                "signal":c["signal"],"confidence":c["confidence"],
-                "confluence_score":c["confluence_score"],
-                "modules":{"trend":t,"structure":st,"session":se,"momentum":m,"volatility":v,"sr_zones":sr},
-                "module_scores":c["module_scores"]}
-
-def build_features_for_brain1v2(df):
-    d = df.copy()
-    c = d["close"]; h = d["high"]; l = d["low"]; o = d["open"]
-    def ema(s, n): return s.ewm(span=n, adjust=False).mean()
-    def sma(s, n): return s.rolling(n).mean()
-    def std(s, n): return s.rolling(n).std()
-
-    d["return_1"]  = c.pct_change(1)
-    d["return_3"]  = c.pct_change(3)
-    d["return_5"]  = c.pct_change(5)
-    d["return_10"] = c.pct_change(10)
-
-    for n in [5,10,20,50,100,200]:
-        d[f"ema_{n}"]     = ema(c,n)
-        d[f"c_vs_ema{n}"] = (c - ema(c,n)) / ema(c,n)
-    for n in [10,20,50]:
-        d[f"sma_{n}"]     = sma(c,n)
-        d[f"c_vs_sma{n}"] = (c - sma(c,n)) / sma(c,n)
-
-    delta = c.diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
-    d["rsi_14"] = 100 - 100/(1+gain/(loss+1e-9))
-    for n, col in [(7,"rsi_7"),(21,"rsi_21")]:
-        g  = delta.clip(lower=0).rolling(n).mean()
-        ls = (-delta.clip(upper=0)).rolling(n).mean()
-        d[col] = 100 - 100/(1+g/(ls+1e-9))
-    d["rsi_div"] = d["rsi_14"] - d["rsi_14"].shift(5)
-
-    d["macd"]        = ema(c,12) - ema(c,26)
-    d["macd_signal"] = ema(d["macd"],9)
-    d["macd_hist"]   = d["macd"] - d["macd_signal"]
-
-    for n in [20,14]:
-        mid  = sma(c,n); band = 2*std(c,n)
-        d[f"bb_upper_{n}"] = mid+band
-        d[f"bb_lower_{n}"] = mid-band
-        d[f"bb_pct_{n}"]   = (c-(mid-band))/(2*band+1e-9)
-        d[f"bb_width_{n}"] = (2*band)/(mid+1e-9)
-
-    tr = pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
-    d["atr_14"] = tr.rolling(14).mean()
-    d["atr_7"]  = tr.rolling(7).mean()
-    d["atr_21"] = tr.rolling(21).mean()
-
-    low14=l.rolling(14).min(); high14=h.rolling(14).max()
-    d["stoch_k"]  = 100*(c-low14)/(high14-low14+1e-9)
-    d["stoch_d"]  = d["stoch_k"].rolling(3).mean()
-    d["willr_14"] = -100*(high14-c)/(high14-low14+1e-9)
-
-    tp2=(h+l+c)/3
-    d["cci_20"] = (tp2-sma(tp2,20))/(0.015*std(tp2,20)+1e-9)
-
-    plus_dm  = (h-h.shift()).clip(lower=0)
-    minus_dm = (l.shift()-l).clip(lower=0)
-    d["adx_14"] = (plus_dm.rolling(14).mean()-minus_dm.rolling(14).mean()).abs()/(tr.rolling(14).mean()+1e-9)*100
-
-    if "volume" in d.columns and d["volume"].sum() > 0:
-        d["volume_ratio"] = d["volume"]/(d["volume"].rolling(10).mean()+1e-9)
-    else:
-        d["volume_ratio"] = 1.0
-
-    d["candle_body"] = (c-o).abs()/(h-l+1e-9)
-    d["upper_wick"]  = (h-pd.concat([c,o],axis=1).max(axis=1))/(h-l+1e-9)
-    d["lower_wick"]  = (pd.concat([c,o],axis=1).min(axis=1)-l)/(h-l+1e-9)
-    d["candle_dir"]  = np.sign(c-o)
-
-    d["hour"]     = df.index.hour
-    d["sin_hour"] = np.sin(2*np.pi*d["hour"]/24)
-    d["cos_hour"] = np.cos(2*np.pi*d["hour"]/24)
-    d["dow"]      = df.index.dayofweek
-    d["sin_dow"]  = np.sin(2*np.pi*d["dow"]/5)
-    d["cos_dow"]  = np.cos(2*np.pi*d["dow"]/5)
-
-    d["mom_5"]  = c - c.shift(5)
-    d["mom_10"] = c - c.shift(10)
-    d["mom_20"] = c - c.shift(20)
-
-    d["vol_ratio_5_20"] = std(c,5)/(std(c,20)+1e-9)
-    d["trend_5_20"]     = (ema(c,5)-ema(c,20))/(ema(c,20)+1e-9)
-    d["trend_10_50"]    = (ema(c,10)-ema(c,50))/(ema(c,50)+1e-9)
-    d["pos_in_day"]     = (c-l)/(h-l+1e-9)
-    d["gap"]            = (o-c.shift(1))/(c.shift(1)+1e-9)
-
-    return d.dropna()
-
-def send_telegram(msg_or_signal, price=None, score=None, b1_prob=None,
-                  b2_score=None, atr=None, h4=None, tp=None, sl=None, tp2=None):
-    if price is None:
-        msg = msg_or_signal
-    else:
-        signal = msg_or_signal
-        if signal not in ["BUY","SELL"]: return
-        if tp is None or sl is None:
-            tp = round(price + atr*1.5, 2) if signal=="BUY" else round(price - atr*1.5, 2)
-            sl = round(price - atr,     2) if signal=="BUY" else round(price + atr,     2)
-        if tp2 is None:
-            tp2 = round(price + atr*2.5, 2) if signal=="BUY" else round(price - atr*2.5, 2)
-        _tp_usd = round(abs(tp  - price) * 3, 2)
-        _t2_usd = round(abs(tp2 - price) * 3, 2)
-        _sl_usd = round(abs(sl  - price) * 3, 2)
-        rr      = round(_tp_usd / _sl_usd, 2) if _sl_usd > 0 else 0
-        icon    = "🟢" if signal=="BUY" else "🔴"
-        h4_line = ""
-        if h4:
-            h4_icon = "📈" if h4.get("direction")=="BUY" else "📉" if h4.get("direction")=="SELL" else "➡️"
-            h4_line = f"H4     : {h4_icon} {h4.get('direction','—')} | RSI {h4.get('rsi','—')}\n"
-        msg = (
-            f"{icon} {signal} XAU/USD\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Entry  : ${price:,.2f}\n"
-            f"TP1    : ${tp:,.2f}  (+${round(abs(tp-price),2)})\n"
-            f"TP2    : ${tp2:,.2f}  (+${round(abs(tp2-price),2)})\n"
-            f"SL     : ${sl:,.2f}  (-${round(abs(sl-price),2)})\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Score  : {round(score,2)}/10\n"
-            f"Brain1 : {round(b1_prob,3)}\n"
-            f"Brain2 : {round(b2_score,2)}/10\n"
-            f"{h4_line}"
-            f"ATR    : ${round(atr,2)}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Risk   : ${_sl_usd:.2f} | TP1: ${_tp_usd:.2f} | TP2: ${_t2_usd:.2f} | RR: {rr}:1\n"
-            f"Open trade on Exness NOW!"
-        )
+# ── Telegram ──────────────────────────────────────────────────
+def tg(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT: return False
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        r = req.post(
+            "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage",
             json={"chat_id": TELEGRAM_CHAT, "text": msg},
             timeout=10
         )
-        print("Telegram:", r.status_code)
+        return r.status_code == 200
     except Exception as e:
-        print("Telegram error:", e)
+        print("Telegram error: " + str(e))
+        return False
 
-def trailing_sl_check(direction, entry, current_high, current_low,
-                      tp_level, sl_level, be_triggered):
-    if be_triggered: return sl_level, True
-    if direction == "BUY":
-        half_tp = entry + (tp_level - entry) * 0.50
-        if current_high >= half_tp: return entry + 0.10, True
-    else:
-        half_tp = entry - (entry - tp_level) * 0.50
-        if current_low <= half_tp:  return entry - 0.10, True
-    return sl_level, False
+# ── Session helper ────────────────────────────────────────────
+def get_session():
+    t = datetime.now(timezone.utc)
+    m = t.hour * 60 + t.minute
+    if 780 <= m < 1020: return "LONDON/NY OVERLAP", "HIGH",   True,  "🔥"
+    elif 420 <= m < 780: return "LONDON SESSION",   "HIGH",   True,  "🟢"
+    elif 1020 <= m < 1080: return "NEW YORK SESSION","MEDIUM", True,  "🟡"
+    else:                  return "ASIAN/OFF-HOURS", "LOW",    False, "🔵"
 
-# ── Main analysis ─────────────────────────────────────────────────────────────
-def run_analysis():
-    session_quality, trade_allowed = _get_session_quality()
-    now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    print(f"\n🕐 Session: {now_utc} | Quality: {session_quality}")
+PHASE_A_SECS   = 150
+PHASE_B_SECS   = 300
+OFF_HOURS_SECS = 1800
 
-    if not trade_allowed:
-        _price = None
+def get_run_interval():
+    m = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
+    return OFF_HOURS_SECS if not (420 <= m < 1080) else PHASE_A_SECS
+
+# ── Shared state ──────────────────────────────────────────────
+last_result   = {}
+last_run_time = ""
+_prev_health  = {}
+_run_count    = 0
+_last_alerted_sig   = "WAIT"
+_pre_signal         = "WAIT"
+_pre_b1             = 0.0
+_pre_b2             = 0.0
+_pre_time           = 0.0
+_phase_a_count      = 0
+_last_alerted_price = 0.0
+_last_alerted_time  = 0.0
+ALERT_COOLDOWN_SECS = 1800
+_price_cache  = {"price": None, "ts": 0.0}
+_chart_cache  = {"bars": [], "ts": 0.0}
+CHART_CACHE_TTL = 60
+
+def _save_result(result):
+    global last_result, last_run_time, _price_cache
+    last_result   = result
+    last_run_time = datetime.now(timezone.utc).isoformat()
+    if result.get("price"):
+        _price_cache = {"price": result["price"], "ts": time.time()}
+
+def _check_health(result):
+    global _prev_health
+    for key, status in result.get("health", {}).items():
+        was_ok = _prev_health.get(key, {}).get("ok", True)
+        is_ok  = status.get("ok", True)
+        if was_ok and not is_ok:
+            tg("⚠️ FAULT: " + key + "\n" + status.get("msg", ""))
+        elif not was_ok and is_ok:
+            tg("✅ RECOVERED: " + key)
+    _prev_health = {k: dict(v) for k, v in result.get("health", {}).items()}
+
+# ── Endpoints ─────────────────────────────────────────────────
+@api.get("/")
+def root():
+    sname, sq, _, si = get_session()
+    return {"agent":"XAU/USD Triple Brain · Phase 30","status":"running",
+            "session":sname,"session_quality":sq,"session_icon":si,
+            "time":datetime.now(timezone.utc).isoformat(),"last_run":last_run_time or "never",
+            "run_count":_run_count}
+
+@api.get("/health")
+def health_ep():
+    return {"status":"ok","agent_loaded":_agent_loaded,"improvements":IMPROVEMENTS_LOADED,
+            "last_run":last_run_time or "never","last_signal":last_result.get("signal","none"),
+            "run_count":_run_count,"time":datetime.now(timezone.utc).isoformat()}
+
+@api.get("/status")
+def status_ep():
+    sname, sq, stok, si = get_session()
+    base = {"session":sname,"session_quality":sq,"session_trade_ok":stok,"session_icon":si,
+            "last_run":last_run_time or "never","improvements":"ENABLED" if IMPROVEMENTS_LOADED else "DISABLED"}
+    if not last_result:
+        base.update({"signal":"WAIT","confidence":0,"price":0,
+            "msg":"Agent warming up — first run in ~2.5min","health":{
+                "data_feed":   {"ok":_agent_loaded,"msg":"agent "+("ok" if _agent_loaded else "FAILED")},
+                "brain1":      {"ok":False,"msg":"pending first run"},
+                "brain2":      {"ok":False,"msg":"pending first run"},
+                "brain3":      {"ok":False,"msg":"pending first run"},
+                "h4":          {"ok":False,"msg":"pending"},
+                "telegram":    {"ok":bool(TELEGRAM_TOKEN),"msg":"ok" if TELEGRAM_TOKEN else "no token"},
+                "daily_limit": {"ok":True,"msg":"ok"}}})
+        return JSONResponse(content=base)
+    result = dict(last_result)
+    result.update(base)
+    return JSONResponse(content=clean(result))
+
+@api.post("/run-analysis")
+def run_ep():
+    if not _agent_loaded:
+        return JSONResponse(content={"signal":"ERROR","error":"trading_agent.py not loaded"},status_code=500)
+    try:
+        result = run_analysis()
+        _save_result(result)
+        _check_health(result)
+        return JSONResponse(content=clean(result))
+    except Exception as e:
+        return JSONResponse(content={"signal":"ERROR","error":str(e)},status_code=500)
+
+@api.get("/live-price")
+def live_price_ep():
+    global _price_cache
+    now = time.time()
+    if _price_cache["price"] and (now - _price_cache["ts"]) < 30:
+        return JSONResponse(content={"price":_price_cache["price"],"cached":True})
+    td_keys = [k for k in [
+        os.environ.get("TD_KEY","f3883b7831a540cda02cfafcfe77e082"),
+        os.environ.get("TD_KEY2","41c8cfdf490b4bf4a0d388e716a32453"),
+        os.environ.get("TD_KEY3","f58b0a482f1443e78fb23cf8975b44d9"),
+    ] if k]
+    for key in td_keys:
         try:
-            import requests as _rq
-            _k = get_td_key()
-            _r = _rq.get("https://api.twelvedata.com/price",
-                params={"symbol":"XAU/USD","apikey":_k}, timeout=10)
-            _price = float(_r.json().get("price", 0)) or None
-        except Exception:
-            pass
-        return _to_python({
-            "signal":          "WAIT",
-            "confidence":      0,
-            "price":           _price,
-            "session_blocked": True,
-            "session_quality": session_quality,
-            "session_trade_ok":False,
-            "session_icon":    "🔴",
-            "daily_pnl":       _load_daily_pnl()["total_pnl"],
-            "trade_count":     _load_daily_pnl()["trade_count"],
-            "health": {
-                "data_feed":   {"ok":True,  "msg":"Off-hours — price only"},
-                "brain1":      {"ok":True,  "msg":"Standby until 07:00 UTC"},
-                "brain2":      {"ok":True,  "msg":"Standby until 07:00 UTC"},
-                "brain3":      {"ok":True,  "msg":"Standby until 07:00 UTC"},
-                "h4":          {"ok":True,  "msg":"Standby until 07:00 UTC"},
-                "telegram":    {"ok":True,  "msg":"standby"},
-                "daily_limit": {"ok":True,  "msg":"OK"},
-            },
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
+            r = req.get("https://api.twelvedata.com/price",
+                        params={"symbol":"XAU/USD","apikey":key},timeout=8)
+            data = r.json()
+            if "price" in data:
+                price = round(float(data["price"]),2)
+                _price_cache = {"price":price,"ts":now}
+                if last_result: last_result["price"] = price
+                return JSONResponse(content={"price":price,"cached":False,
+                                             "time":datetime.now(timezone.utc).isoformat()})
+        except Exception: continue
+    return JSONResponse(content={"price":last_result.get("price"),"cached":True})
 
-    day_blocked, day_reason, day_pnl = _check_daily_limit()
-    if day_blocked:
-        return {"signal":"WAIT","confidence":0,"price":None,
-                "day_blocked":True,"day_reason":day_reason,
-                "daily_pnl":day_pnl["total_pnl"],"trade_count":day_pnl["trade_count"],
-                "timestamp":datetime.now(timezone.utc).isoformat()}
+@api.get("/chart-data")
+def chart_ep():
+    global _chart_cache
+    if _chart_cache["bars"] and (time.time()-_chart_cache["ts"]) < CHART_CACHE_TTL:
+        return JSONResponse(content={"bars":_chart_cache["bars"],"symbol":"XAU/USD","tf":"15m","cached":True})
+    td_keys = [k for k in [
+        os.environ.get("TD_KEY","f3883b7831a540cda02cfafcfe77e082"),
+        os.environ.get("TD_KEY2","41c8cfdf490b4bf4a0d388e716a32453"),
+        os.environ.get("TD_KEY3","f58b0a482f1443e78fb23cf8975b44d9"),
+    ] if k]
+    for key in td_keys:
+        try:
+            r = req.get("https://api.twelvedata.com/time_series",
+                params={"symbol":"XAU/USD","interval":"15min","outputsize":200,
+                        "apikey":key,"timezone":"UTC","format":"JSON"},timeout=30)
+            data = r.json()
+            if "values" not in data: continue
+            bars = []
+            for v in reversed(data["values"]):
+                try:
+                    bars.append({"time":int(pd.Timestamp(v["datetime"]).timestamp()),
+                                 "open":round(float(v["open"]),2),"high":round(float(v["high"]),2),
+                                 "low":round(float(v["low"]),2),"close":round(float(v["close"]),2)})
+                except Exception: pass
+            _chart_cache["bars"] = bars
+            _chart_cache["ts"]   = time.time()
+            return JSONResponse(content={"bars":bars,"symbol":"XAU/USD","tf":"15m"})
+        except Exception: continue
+    if _chart_cache["bars"]:
+        return JSONResponse(content={"bars":_chart_cache["bars"],"symbol":"XAU/USD","tf":"15m","cached":True,"stale":True})
+    return JSONResponse(content={"error":"All TD keys failed","bars":[]},status_code=500)
 
-    health = {
-        "data_feed":   {"ok":False,"msg":"not run"},
-        "brain1":      {"ok":False,"msg":"not run"},
-        "brain2":      {"ok":False,"msg":"not run"},
-        "brain3":      {"ok":False,"msg":"not run"},
-        "h4":          {"ok":False,"msg":"not run"},
-        "telegram":    {"ok":True, "msg":"standby"},
-        "daily_limit": {"ok":True, "msg":day_reason},
-    }
+@api.get("/test-telegram")
+def test_tg_ep():
+    ok = tg("✅ Telegram test\nagent.ceylonpropertylink.com\n" + datetime.now(timezone.utc).strftime("%H:%M UTC"))
+    return {"ok":ok}
 
-    _b1_use_fallback = False
+@api.post("/telegram/send")
+def tg_ep(body: dict):
+    ok = tg(body.get("message","Test"))
+    return {"ok":ok} if ok else JSONResponse(content={"ok":False,"msg":"Failed"},status_code=500)
+
+@api.get("/entry-analysis")
+def entry_analysis_ep():
+    if not last_result:
+        return {"error": "No signal yet"}
     try:
-        with open("models/brain1_xgboost_v4.pkl","rb") as f:
-            brain1_model = pickle.load(f)
-        if not hasattr(brain1_model, "predict_proba"):
-            raise ValueError(f"Loaded object is {type(brain1_model).__name__}, not XGBoost")
-        with open("models/brain1_features_v4.json") as f:
-            features = json.load(f)
-        THRESHOLD = features.get("threshold", 0.60)
+        cur = sn(_price_cache.get("price"), sn(last_result.get("price"), 0))
+        analysis = get_entry_analysis(last_result, cur)
+        if not analysis:
+            return {"signal": "WAIT", "msg": "No active signal"}
+        return analysis
     except Exception as e:
-        print(f"[B1] Load failed: {e} — using fallback")
-        health["brain1"] = {"ok":False,"msg":f"Model failed: {e}"}
-        _b1_use_fallback = True
-        THRESHOLD = 0.60
-        features  = {"features":[]}
+        return {"error": str(e)}
 
-    # [FIX-3] Declare global so key rotation persists
-    global _td_key_index
+@api.get("/rocket-status")
+def rocket_ep():
+    """Phase 30 — latest Rocket/Waterfall micro-entry status. [FIX-A] _rw_result pre-initialized."""
     try:
-        _td_df = None
-        import requests as _req
-        _all_keys = [k for k in [
-            os.environ.get("TD_KEY",  "f3883b7831a540cda02cfafcfe77e082"),
-            os.environ.get("TD_KEY2", "41c8cfdf490b4bf4a0d388e716a32453"),
-            os.environ.get("TD_KEY3", "f58b0a482f1443e78fb23cf8975b44d9"),
-        ] if k]
-        for _ki, _active_key in enumerate(_all_keys):
-            try:
-                print(f"[DATA] Trying TD key {_ki+1}/{len(_all_keys)}...")
-                _r = _req.get("https://api.twelvedata.com/time_series", params={
-                    "symbol":"XAU/USD","interval":"1h","outputsize":500,
-                    "apikey":_active_key,"timezone":"UTC","format":"JSON"
-                }, timeout=30)
-                _td = _r.json()
-                if "code" in _td or ("message" in _td and "values" not in _td):
-                    print(f"[DATA] TD key {_ki+1} error: {_td.get('message','unknown')} — trying next")
-                    continue
-                if "values" in _td and len(_td["values"]) > 50:
-                    _td_df = pd.DataFrame(_td["values"])
-                    _td_df["datetime"] = pd.to_datetime(_td_df["datetime"])
-                    _td_df = _td_df.set_index("datetime").sort_index()
-                    for _c in ["open","high","low","close"]:
-                        if _c in _td_df.columns:
-                            _td_df[_c] = pd.to_numeric(_td_df[_c], errors="coerce")
-                    _td_df = _td_df[[c for c in ["open","high","low","close"] if c in _td_df.columns]].dropna()
-                    if "volume" not in _td_df.columns:
-                        _td_df["volume"] = 0
-                    _td_key_index = _ki
-                    print(f"[DATA] TD key {_ki+1} OK: {len(_td_df)} bars ✅")
-                    break
-            except Exception as _ke:
-                print(f"[DATA] TD key {_ki+1} exception: {_ke}")
-                continue
-
-        if _td_df is not None and len(_td_df) > 50:
-            df = _td_df
-        else:
-            print("[DATA] All TD keys exhausted — using yfinance emergency fallback")
-            try:
-                import yfinance as yf
-                df = yf.download("GC=F", period="60d", interval="1h",
-                                 auto_adjust=False, progress=False)
-                df.columns = [c[0].lower() if isinstance(c,tuple) else c.lower() for c in df.columns]
-                df = df[["open","high","low","close"]].dropna()
-                df.index = pd.to_datetime(df.index)
-                try: df.index = df.index.tz_convert(None)
-                except: pass
-                df = df[df.index.dayofweek < 5]
-                print(f"[DATA] yfinance fallback: {len(df)} bars ⚠️")
-            except Exception as yfe:
-                raise ValueError(f"All 3 TD keys failed + yfinance failed: {yfe}")
-
-        if len(df) < 10: raise ValueError(f"Only {len(df)} rows")
-        health["data_feed"] = {"ok":True,"msg":f"{len(df)} bars loaded"}
-    except Exception as e:
-        health["data_feed"] = {"ok":False,"msg":f"Feed error: {e}"}
-        return {"signal":"ERROR","confidence":0,"price":None,"health":health,
-                "timestamp":datetime.now(timezone.utc).isoformat()}
-
-    try:
-        df_live = build_features_for_brain1v2(df)
-        if df_live is None or len(df_live) == 0:
-            raise ValueError("Feature builder returned empty dataframe")
-    except Exception as e:
-        health["data_feed"] = {"ok":False,"msg":f"Feature build failed: {e}"}
-        return {"signal":"ERROR","confidence":0,"price":None,"health":health,
-                "timestamp":datetime.now(timezone.utc).isoformat()}
-
-    # Brain 1
-    try:
-        if _b1_use_fallback:
-            row = df_live.iloc[-1]
-            _score = 5.0
-            _rsi   = float(row.get("rsi_14", 50))
-            _bb    = float(row.get("bb_pct_20", 0.5))
-            _stoch = float(row.get("stoch_k", 50))
-            _macdh = float(row.get("macd_hist", 0))
-            if _rsi < 30: _score += 2.0
-            elif _rsi < 40: _score += 1.0
-            elif _rsi > 70: _score -= 2.0
-            elif _rsi > 60: _score -= 1.0
-            _ema5  = float(row.get("ema_5", 0))
-            _ema20_val = float(row.get("ema_20", 0))
-            if _ema5 and _ema20_val:
-                _score += 1.0 if _ema5 > _ema20_val else -1.0
-            _score += 0.5 if _macdh > 0 else -0.5
-            if _bb < 0.1: _score += 1.5
-            elif _bb > 0.9: _score -= 1.5
-            if _stoch < 20: _score += 1.0
-            elif _stoch > 80: _score -= 1.0
-            _score  = max(0.0, min(10.0, _score))
-            b1_buy  = _score / 10.0; b1_sell = 1.0 - b1_buy
-            b1_dir  = "BUY" if b1_buy>=0.65 else "SELL" if b1_sell>=0.65 else "WAIT"
-            b1_score = _score
-            health["brain1"] = {"ok":True,"msg":f"FALLBACK prob={round(b1_buy,3)} threshold={THRESHOLD}"}
-        else:
-            missing = [f for f in features["features"] if f not in df_live.columns]
-            if missing:
-                raise ValueError(f"Missing features: {missing[:3]}{'...' if len(missing)>3 else ''}")
-            X     = df_live[features["features"]].iloc[[-1]]
-            prob  = brain1_model.predict_proba(X)[0]
-            b1_buy = float(prob[1]); b1_sell = float(prob[0])
-            b1_dir  = "BUY" if b1_buy>=THRESHOLD else "SELL" if b1_sell>=THRESHOLD else "WAIT"
-            b1_score = b1_buy * 10
-            health["brain1"] = {"ok":True,"msg":f"XGBoost prob={round(b1_buy,3)} threshold={THRESHOLD}"}
-    except Exception as e:
-        health["brain1"] = {"ok":False,"msg":f"Inference failed: {e}"}
-        b1_buy=0.5; b1_sell=0.5; b1_dir="WAIT"; b1_score=5.0
-
-    # Brain 2
-    try:
-        brain2  = Brain2Analyzer()
-        report  = brain2.analyze(df_live)
-        b2_sig  = report["signal"]
-        b2_score = report["confluence_score"]
-        m       = report["modules"]
-        health["brain2"] = {"ok":True,"msg":f"score={b2_score} signal={b2_sig}"}
-    except Exception as e:
-        health["brain2"] = {"ok":False,"msg":f"Analysis failed: {e}"}
-        b2_sig="WAIT"; b2_score=5.0
-        m={"trend":{"direction":"UNKNOWN","strength":"UNKNOWN","ema20":None,"ema50":None},
-           "structure":{"structure":"UNKNOWN"},
-           "momentum":{"rsi":50,"state":"UNKNOWN","rocket_score":0,"waterfall_score":0},
-           "volatility":{"atr14":15},
-           "sr_zones":{"nearest_support":0,"nearest_resistance":0,
-                       "dist_to_support_pct":0,"dist_to_resistance_pct":0}}
-        report={"signal":"WAIT","confluence_score":5.0,"modules":m}
-
-    # Signal fusion
-    fused = (b1_score*0.4) + (b2_score*0.6)
-    rocket    = m["momentum"].get("rocket_score", 0)
-    waterfall = m["momentum"].get("waterfall_score", 0)
-
-    # [FIX-4] B2 direction: BUY / SELL / WAIT
-    _b2_up = b2_sig.upper()
-    if any(x in _b2_up for x in ["BUY","BULL"]):
-        b2_dir = "BUY"
-    elif any(x in _b2_up for x in ["SELL","BEAR"]):
-        b2_dir = "SELL"
-    else:
-        b2_dir = "WAIT"
-
-    if b1_dir == b2_dir and b1_dir != "WAIT":
-        fused += 0.5
-        print(f"   ✅ B1+B2 aligned ({b1_dir}) → fused +0.5")
-
-    # [FIX-1] The broken gate block that used undefined `sig` has been REMOVED.
-
-    # H4 directional bonus (before final sig)
-    try:
-        _h4_pre = _get_h4_trend(df)
-        _h4_dir = _h4_pre.get("direction","NEUTRAL")
-        if _h4_dir == "BUY"  and b1_dir == "BUY"  and fused > 5.0:
-            fused += 0.4
-            print(f"   📈 H4 BUY aligned → fused +0.4")
-        elif _h4_dir == "SELL" and b1_dir == "SELL" and fused < 5.0:
-            fused -= 0.4
-            print(f"   📉 H4 SELL aligned → fused -0.4")
-    except Exception:
+        res = _rw_result  # now safe — pre-initialized at module level
+        if res:
+            return JSONResponse(content=clean(res))
+    except NameError:
         pass
-
-    # Decide signal from fused
-    if   fused >= 6.5: sig, conf = "BUY",  "HIGH" if fused >= 8 else "MEDIUM"
-    elif fused <= 3.5: sig, conf = "SELL", "HIGH" if fused <= 2 else "MEDIUM"
-    else:              sig, conf = "WAIT", "LOW"
-
-    # [FIX-2] SINGLE Rocket/Waterfall gate (was duplicated 3x, one broken)
-    if sig == "BUY" and rocket < 50:
-        print(f"   ⛔ Rocket={rocket} < 50 — BUY momentum not confirmed → WAIT")
-        sig, conf = "WAIT", "LOW"
-        fused = min(fused, 6.4)
-    elif sig == "SELL" and waterfall < 50:
-        print(f"   ⛔ Waterfall={waterfall} < 50 — SELL momentum not confirmed → WAIT")
-        sig, conf = "WAIT", "LOW"
-        fused = min(fused, 6.4)
-    elif sig == "BUY":
-        print(f"   🚀 Rocket={rocket} CONFIRMED → BUY")
-    elif sig == "SELL":
-        print(f"   💧 Waterfall={waterfall} CONFIRMED → SELL")
-
-    price   = round(float(df_live["close"].iloc[-1]), 2)
-    atr_raw = float(m["volatility"]["atr14"])
-    atr     = round(atr_raw, 2)
-    support    = float(m["sr_zones"]["nearest_support"])
-    resistance = float(m["sr_zones"]["nearest_resistance"])
-    ema20_val  = float(m["trend"]["ema20"]) if m["trend"]["ema20"] else price
-
-    sr_gap = abs(resistance - support)
-    tight_range = sr_gap < 10.0
-    if tight_range:
-        print(f"⚠️  Tight range: S/R gap ${sr_gap:.2f} < $10 → WAIT")
-        sig   = "WAIT"
-        fused = min(fused, 4.9)
-
-    price_below_support = price < support
-    price_below_ema20   = price < ema20_val
-    sr_flip_active      = price_below_support
-
-    if price_below_support and price_below_ema20 and not tight_range:
-        print(f"⚠️  Price ${price:.2f} below support ${support:.2f} AND EMA20 ${ema20_val:.2f} → B2 -1.5")
-        b2_score = round(b2_score - 1.5, 2)
-        if b2_score < 5.0:
-            sig   = "WAIT"
-            fused = min(fused, 4.9)
-
-    # H4 veto
-    try:
-        h4     = _get_h4_trend(df)
-        h4_dir = h4["direction"]
-        h4_veto = False
-        health["h4"] = {"ok":True,"msg":f"{h4_dir} | {h4['reason']}"}
-    except Exception as e:
-        h4     = {"direction":"NEUTRAL","reason":f"error: {e}","ema20":None,"ema50":None,"rsi":None,"atr":None,"score":5}
-        h4_dir = "NEUTRAL"; h4_veto = False
-        health["h4"] = {"ok":False,"msg":f"H4 error: {e}"}
-
-    sig_before_veto = sig
-    if sig in ("BUY","SELL") and h4_dir != "NEUTRAL" and sig != h4_dir:
-        h4_veto = True
-        sig     = "WAIT"
-        conf    = "LOW"
-        print(f"   ⚠️  H4 VETO — {sig_before_veto} blocked (H4={h4_dir})")
-
-    tp  = round(price + atr*1.5, 2) if sig=="BUY" else round(price - atr*1.5, 2)
-    tp2 = round(price + atr*2.5, 2) if sig=="BUY" else round(price - atr*2.5, 2)
-    sl  = round(price - atr,     2) if sig=="BUY" else round(price + atr,     2)
-
-    # Brain 3 (Groq)
-    sr_flip_note = "\n⚠️ NOTE: Price broke below support — possible S/R flip" if sr_flip_active else ""
-    tight_note   = "\n⚠️ NOTE: Tight S/R range — low reward potential" if tight_range else ""
-    prompt = (
-        f"You are an expert XAU/USD gold trading analyst.\n\n"
-        f"Price: ${price} | Signal: {sig} | Score: {round(fused,2)}/10\n"
-        f"Brain1: {b1_dir} | Brain2: {b2_sig}\n"
-        f"H4 Trend: {h4_dir} | {h4['reason']}\n"
-        f"Trend: {m['trend']['direction']} {m['trend']['strength']}\n"
-        f"Structure: {m['structure']['structure']}\n"
-        f"RSI: {m['momentum']['rsi']} | {m['momentum']['state']}\n"
-        f"ATR: {atr} | Support: {support} | Resistance: {resistance}\n"
-        f"S/R gap: ${sr_gap:.2f}{sr_flip_note}{tight_note}\n\n"
-        f"Give 5-line trading briefing. Be specific about WHY signal is {sig}."
-    )
-    import requests as req
-    b3_text = None
-    global _groq_model_index, _groq_key_index
-    _total_attempts = len(_GROQ_KEYS) * len(GROQ_MODELS)
-    for _attempt in range(_total_attempts):
-        _key   = _GROQ_KEYS[_groq_key_index % len(_GROQ_KEYS)]
-        _model = GROQ_MODELS[_groq_model_index % len(GROQ_MODELS)]
-        try:
-            resp = req.post("https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization":f"Bearer {_key}","Content-Type":"application/json"},
-                json={"model":_model,"max_tokens":150,
-                      "messages":[{"role":"user","content":prompt}]},timeout=15)
-            data = resp.json()
-            err_msg = data.get("error",{}).get("message","") if "error" in data else ""
-            if "rate_limit" in err_msg.lower() or "limit" in err_msg.lower() or "choices" not in data:
-                print(f"[B3] key{_groq_key_index+1}/{_model} limited — rotating key")
-                _groq_key_index  += 1
-                if _groq_key_index % len(_GROQ_KEYS) == 0:
-                    _groq_model_index += 1
-                continue
-            b3_text = data["choices"][0]["message"]["content"]
-            health["brain3"] = {"ok":True,"msg":f"model={_model} key={_groq_key_index%len(_GROQ_KEYS)+1}/{len(_GROQ_KEYS)}"}
-            break
-        except Exception as e:
-            print(f"[B3] {_model} error: {e}")
-            _groq_key_index += 1
-    if not b3_text:
-        b3_text = (f"B3 unavailable — all {len(_GROQ_KEYS)} keys × {len(GROQ_MODELS)} models at limit. "
-                   f"B1={round(b1_buy,3)} B2={b2_score}. Signal based on B1+B2 only.")
-        health["brain3"] = {"ok":False,"msg":f"All {len(_GROQ_KEYS)} Groq keys rate limited"}
-
-    check_sr_flip(price, support, resistance, atr)
-
-    try:
-        send_telegram(sig, price, fused, b1_buy, b2_score, atr, h4, tp=tp, sl=sl, tp2=tp2)
-        health["telegram"] = {"ok":True,"msg":"alert sent" if sig in ("BUY","SELL") else "standby"}
-    except Exception as e:
-        health["telegram"] = {"ok":False,"msg":f"Telegram failed: {e}"}
-
-    session_icon = "🟢" if "HIGH" in session_quality else "🟡" if session_quality=="MEDIUM" else "🔴"
-
-    return _to_python({
-        "signal":           sig,
-        "confidence":       round(fused, 2),
-        "price":            price,
-        "brain1":           {"prediction":1 if b1_dir=="BUY" else 0,"probability":round(b1_buy,3)},
-        "brain2":           {"score":b2_score,"details":{
-                                "trend":m["trend"]["direction"],
-                                "momentum":m["momentum"]["state"],
-                                "support":support,"resistance":resistance,
-                                "dist_support_pct":m["sr_zones"]["dist_to_support_pct"],
-                                "dist_resistance_pct":m["sr_zones"]["dist_to_resistance_pct"],
-                                "rocket_score":rocket,
-                                "waterfall_score":waterfall,
-                            }},
-        "brain3":           {"verdict":sig,"reasoning":b3_text},
-        "h4":               h4,
-        "h4_veto":          h4_veto,
-        "tp":               tp,
-        "tp2":              tp2,
-        "sl":               sl,
-        "atr":              atr,
-        "session":          session_quality,
-        "session_blocked":  False,
-        "session_trade_ok": True,
-        "session_icon":     session_icon,
-        "day_blocked":      False,
-        "daily_pnl":        day_pnl["total_pnl"],
-        "trade_count":      day_pnl["trade_count"],
-        "health":           health,
-        "timestamp":        datetime.now(timezone.utc).isoformat(),
-        "last_run":         datetime.now(timezone.utc).isoformat(),
-        "improvements":     "ENABLED",
-        "sr_flip_active":   sr_flip_active,
-        "tight_range":      tight_range,
-        "sr_gap":           round(sr_gap, 2),
-        "rocket_score":     rocket,
-        "waterfall_score":  waterfall,
+    return JSONResponse(content={
+        "rocket":0, "waterfall":0, "signal":"WAIT",
+        "msg":"Warming up — first 1m scan in <60s",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 30 — ROCKET/WATERFALL MICRO-ENTRY SYSTEM (1-minute bars)
-# ═══════════════════════════════════════════════════════════════════════════════
+@api.get("/files")
+def files_ep():
+    files = {}
+    for name in ["brain1_xgboost_v4.pkl","brain1_features_v4.json","dynamic_tpsl_config.json"]:
+        path = MODELS_DIR + "/" + name
+        files[name] = {"exists":os.path.exists(path),
+                       "size_kb":round(os.path.getsize(path)/1024,1) if os.path.exists(path) else 0}
+    return {"files":files,"RUN_INTERVAL":RUN_INTERVAL,"telegram":"SET" if TELEGRAM_TOKEN else "NOT SET",
+            "agent_loaded":_agent_loaded,"improvements":"ENABLED" if IMPROVEMENTS_LOADED else "DISABLED"}
 
-_rw_last_rocket    = 0
-_rw_last_waterfall = 0
-_rw_pre_alerted    = False
-_rw_alerted        = False
-_rw_alert_dir      = "WAIT"
-_rw_alert_time     = 0.0
-_rw_alert_price    = 0.0
-_rw_1m_cache       = None
-_rw_1m_cache_ts    = 0.0
-_RW_CACHE_TTL      = 45
-_RW_ENTRY_COOLDOWN = 600
-_RW_PRE_THRESHOLD  = 40
-_RW_ENTRY_THRESHOLD= 60
+# ── Scheduler ─────────────────────────────────────────────────
+def scheduler():
+    global _run_count, _volatility_ma, _phase_a_count
+    time.sleep(10)  # was 20 — reduced startup delay
+    sname, _, _, _ = get_session()
+    tg(
+        "🚀 AGENT STARTED · Phase 30\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Schedule: 2.5min/5min dual-phase\n"
+        "Rocket scanner: 60s (1m bars)\n"
+        "Session: " + sname + "\n"
+        "Time: " + datetime.now(timezone.utc).strftime("%H:%M UTC") + "\n"
+        "Improvements: " + ("✅ ENABLED" if IMPROVEMENTS_LOADED else "⚠️ DISABLED") + "\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "agent.ceylonpropertylink.com"
+    )
 
-# [ADD-2] Aliases for main.py's mismatched names
-_RW_COOLDOWN       = _RW_ENTRY_COOLDOWN
-_rw_alert_ts       = _rw_alert_time
-_rw_entry_alerted  = False
-_rw_result         = None
+    # [WARMUP] Immediate Phase B on startup — no 2.5min wait after redeploy
+    # Force _phase_a_count to 1 so first iteration is Phase B (full analysis + B3)
+    _phase_a_count = 1
+    print("[STARTUP] Running IMMEDIATE full analysis (no warmup wait)...")
 
-def _fetch_1m_bars():
-    """[ADD-1] 1-minute bars for maximum rocket/waterfall responsiveness."""
-    global _rw_1m_cache, _rw_1m_cache_ts
-    import time as _time_mod
-    now = _time_mod.time()
-    if _rw_1m_cache is not None and (now - _rw_1m_cache_ts) < _RW_CACHE_TTL:
-        return _rw_1m_cache
-    all_keys = [k for k in [
-        os.environ.get("TD_KEY",  "f3883b7831a540cda02cfafcfe77e082"),
-        os.environ.get("TD_KEY2", "41c8cfdf490b4bf4a0d388e716a32453"),
-        os.environ.get("TD_KEY3", "f58b0a482f1443e78fb23cf8975b44d9"),
-    ] if k]
-    for key in all_keys:
+    while True:
+        now_str          = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        sname2, sq2, stok2, _ = get_session()
+        print("[" + now_str + "] Running | " + sq2)
+
         try:
-            r = requests.get("https://api.twelvedata.com/time_series", params={
-                "symbol": "XAU/USD", "interval": "1min", "outputsize": 120,
-                "apikey": key, "timezone": "UTC", "format": "JSON"
-            }, timeout=15)
-            d = r.json()
-            if "values" not in d:
-                continue
-            rows = []
-            for v in reversed(d["values"]):
+            global _pre_signal, _pre_b1, _pre_b2, _pre_time
+            _phase_a_count += 1
+            is_phase_b = (_phase_a_count % 2 == 0)
+
+            # ── PHASE A ───────────────────────────────────────────
+            if not is_phase_b:
+                print("[PHASE A] Pre-computing B1+B2...")
                 try:
-                    rows.append({
-                        "open":  float(v["open"]),
-                        "high":  float(v["high"]),
-                        "low":   float(v["low"]),
-                        "close": float(v["close"]),
-                        "datetime": v["datetime"],
-                    })
+                    result_a = run_analysis()
+                    _pre_b1  = sn((result_a.get("brain1") or {}).get("probability"), 0)
+                    _pre_b2  = sn((result_a.get("brain2") or {}).get("score"), 0)
+                    _pre_time= time.time()
+
+                    # [FIX-B] Properly detect BUY / SELL / WAIT direction
+                    if _pre_b1 >= 0.600 and _pre_b2 >= 5.0:
+                        _trend_raw = (result_a.get("brain2",{}).get("details",{}) or {}).get("trend","")
+                        _trend_up  = str(_trend_raw).upper()
+                        if "BULL" in _trend_up:
+                            _pre_signal = "BUY"
+                        elif "BEAR" in _trend_up:
+                            _pre_signal = "SELL"
+                        else:
+                            _pre_signal = "WAIT"
+                    else:
+                        _pre_signal = "WAIT"
+
+                    _save_result(result_a)
+                    price_a = sn(result_a.get("price"), 0)
+                    print("  [A] B1=" + sf(_pre_b1,3) + " B2=" + sf(_pre_b2,1) + " Pre=" + _pre_signal + " $" + sf(price_a))
+                except Exception as ea:
+                    print("  [A] Pre-analysis error: " + str(ea)[:100])
+                time.sleep(PHASE_A_SECS)
+                continue
+
+            # ── PHASE B ───────────────────────────────────────────
+            print("[PHASE B] Full analysis with B3 confirmation...")
+            result = run_analysis()
+            _run_count += 1
+            _save_result(result)
+            _check_health(result)
+
+            sig   = str(result.get("signal")  or "WAIT").upper()
+            conf  = sn(result.get("confidence"), 0)
+            price = sn(result.get("price"),       0)
+            b1    = sn((result.get("brain1") or {}).get("probability"), 0)
+            b2    = sn((result.get("brain2") or {}).get("score"),       0)
+            b3v   = str((result.get("brain3") or {}).get("verdict","—"))
+            tp    = sn(result.get("tp"),   0)
+            tp2   = sn(result.get("tp2"),  0)
+            sl    = sn(result.get("sl"),   0)
+            h4d   = str((result.get("h4") or {}).get("direction","—"))
+            h4v   = bool(result.get("h4_veto",        False))
+            sb    = bool(result.get("session_blocked", False))
+
+            phase_consistent = (
+                (_pre_signal == sig) or
+                (sig in ("BUY","SELL") and abs(time.time()-_pre_time) < 400)
+            )
+
+            if sig in ("BUY","SELL") and not phase_consistent:
+                print("  [B] SUPPRESSED — Phase A=" + _pre_signal + " Phase B=" + sig + " (inconsistent)")
+                sig = "WAIT"
+
+            print("  [B] " + sig + " | B1=" + sf(b1,3) + " B2=" + sf(b2,1) + " B3=" + b3v + " conf=" + sf(conf,1) + " $" + sf(price))
+
+            if IMPROVEMENTS_LOADED:
+                try:
+                    atr_val = sn(result.get("atr", 15.0), 15.0)
+                    _atr_history.append(atr_val)
+                    if len(_atr_history) > 20: _atr_history.pop(0)
+                    _volatility_ma = float(np.mean(_atr_history)) if _atr_history else 15.0
+                    news_coming, event_name, minutes_until = is_news_event_soon()
+                    if news_coming:
+                        print("   NEWS: " + event_name + " in " + str(round(minutes_until)) + " min")
+                        sig = "WAIT"
+                    market_condition    = detect_market_condition(atr_val, _volatility_ma)
+                    recommended_lot     = calculate_position_size(atr_val)
+                    risk_level          = get_volatility_risk_level(atr_val)
+                    print("   Market: " + market_condition + " | Lot: " + sf(recommended_lot) + " | Risk: " + risk_level)
+                except Exception as e:
+                    print("   Improvements error: " + str(e))
+
+            # ── Alert gating ──────────────────────────────────────
+            global _last_alerted_sig, _last_alerted_price, _last_alerted_time
+            now_ts       = time.time()
+            cooldown_ok  = (now_ts - _last_alerted_time) >= ALERT_COOLDOWN_SECS
+            dir_changed  = sig != _last_alerted_sig
+            price_moved  = abs(price - _last_alerted_price) > 8.0
+
+            session_quality_ok = sq2 in ("HIGH", "MEDIUM")
+            rocket_score    = sn((result.get("brain2") or {}).get("details", {}).get("rocket_score"), 0)
+            waterfall_score = sn((result.get("brain2") or {}).get("details", {}).get("waterfall_score"), 0)
+            momentum_ok = (
+                (sig == "BUY"  and rocket_score    >= 50) or
+                (sig == "SELL" and waterfall_score >= 50)
+            )
+
+            should_alert = (cooldown_ok and session_quality_ok and momentum_ok) or dir_changed
+
+            if sig in ("BUY", "SELL") and should_alert:
+                # [FIX-D] Compute mins_since BEFORE resetting timestamp
+                mins_since = round((now_ts - _last_alerted_time)/60, 1) if _last_alerted_time else 0
+                _last_alerted_sig   = sig
+                _last_alerted_price = price
+                _last_alerted_time  = now_ts
+                print("   📱 ALERT: " + sig + " (last alert " + str(mins_since) + "m ago)")
+                icon = "📈" if sig == "BUY" else "📉"
+                rr   = round(abs(tp-price)/abs(sl-price),1) if abs(sl-price) > 0 else 0
+
+                if IMPROVEMENTS_LOADED:
+                    try:
+                        tracker.log_trade(
+                            entry_time=datetime.now(timezone.utc).isoformat(),
+                            entry_price=price, exit_time=datetime.now(timezone.utc).isoformat(),
+                            exit_price=price,  signal=sig, b1_score=b1, b2_score=b2,
+                            b3_score=conf,     session=sname2
+                        )
+                    except Exception: pass
+
+                ea = get_entry_analysis(result, price)
+                if ea:
+                    q_emoji = "🟢" if ea["quality"]>=8 else "🟡" if ea["quality"]>=5 else "🔴"
+                    entry_guide = (
+                        "Option A (Market): $" + sf(price) + "\n"
+                        "Option B (Limit):  $" + sf(ea["limit_price"]) + " (+" + sf(ea["limit_offset"]) + " better)\n"
+                        "Valid zone: $" + sf(ea["zone_low"]) + " — $" + sf(ea["zone_high"]) + "\n"
+                        "If price > $" + sf(ea["zone_high"]) + " → SKIP"
+                    )
+                else:
+                    entry_guide = "Entry: $" + sf(price)
+                    q_emoji = "🟡"
+
+                mom_line = ("🚀 Rocket: " + str(int(rocket_score)) + "/100\n") if sig=="BUY" else ("💧 Waterfall: " + str(int(waterfall_score)) + "/100\n")
+                tg(
+                    icon + " " + sig + " XAU/USD\n"
+                    + "━━━━━━━━━━━━━━━━━━━━\n"
+                    + "Entry: $" + sf(price) + "  Quality: " + q_emoji + " " + (sf(ea["quality"],0)+"/10" if ea else "—") + "\n"
+                    + entry_guide + "\n"
+                    + "━━━━━━━━━━━━━━━━━━━━\n"
+                    + "TP1: $" + sf(tp)  + " (+" + sf(abs(tp -price)) + ")  TP2: $" + sf(tp2) + "\n"
+                    + "SL:  $" + sf(sl)  + " (-" + sf(abs(sl -price)) + ")\n"
+                    + "━━━━━━━━━━━━━━━━━━━━\n"
+                    + "Score: " + sf(conf,2) + "/10  RR: 1:" + sf(rr,1) + "\n"
+                    + "B1: " + sf(b1,3) + "  B2: " + sf(b2,1) + "/10  H4: " + h4d + "\n"
+                    + mom_line
+                    + "WR: 80.3%  Lot: 0.03\n"
+                    + "━━━━━━━━━━━━━━━━━━━━\n"
+                    + sname2 + " | " + now_str + "\n"
+                    + "agent.ceylonpropertylink.com"
+                )
+
+            if sig == "WAIT" and _last_alerted_sig in ("BUY","SELL"):
+                _last_alerted_sig   = "WAIT"
+                _last_alerted_price = 0.0
+
+            # ── SL / TP price alerts ──────────────────────────────
+            _tp1  = sn(last_result.get("tp"),  0)
+            _tp2  = sn(last_result.get("tp2"), 0)
+            _sl   = sn(last_result.get("sl"),  0)
+            _atr  = sn(last_result.get("atr"), 15)
+
+            if _last_alerted_sig == "BUY" and _sl > 0 and price > 0:
+                dist_to_sl = price - _sl
+                if 0 < dist_to_sl < _atr * 0.3:
+                    tg("⚠️ SL WARNING BUY\nPrice: $" + sf(price) + "\nSL: $" + sf(_sl) + " (" + sf(dist_to_sl) + " away)\nConsider closing!\nagent.ceylonpropertylink.com")
+                    print("SL WARNING sent")
+                elif price < _sl:
+                    tg("🛑 SL BREACHED BUY\nPrice: $" + sf(price) + "\nSL: $" + sf(_sl) + "\nLoss: ~$" + sf(abs(price-_sl)*3) + "\nCLOSE NOW on Exness!\nagent.ceylonpropertylink.com")
+                    print("SL BREACH sent")
+                    _last_alerted_sig = "WAIT"
+                elif _tp1 > 0 and price >= _tp1:
+                    tg("🎯 TP1 HIT BUY\nPrice: $" + sf(price) + "\nTP1: $" + sf(_tp1) + "\nProfit: ~$" + sf(abs(price-_last_alerted_price)*3) + "\nMove SL to breakeven. TP2: $" + sf(_tp2) + "\nagent.ceylonpropertylink.com")
+                    print("TP1 HIT sent")
+
+            elif _last_alerted_sig == "SELL" and _sl > 0 and price > 0:
+                dist_to_sl = _sl - price
+                if 0 < dist_to_sl < _atr * 0.3:
+                    tg("⚠️ SL WARNING SELL\nPrice: $" + sf(price) + "\nSL: $" + sf(_sl) + " (" + sf(dist_to_sl) + " away)\nConsider closing!\nagent.ceylonpropertylink.com")
+                    print("SL WARNING sent")
+                elif price > _sl:
+                    tg("🛑 SL BREACHED SELL\nPrice: $" + sf(price) + "\nSL: $" + sf(_sl) + "\nLoss: ~$" + sf(abs(price-_sl)*3) + "\nCLOSE NOW on Exness!\nagent.ceylonpropertylink.com")
+                    print("SL BREACH sent")
+                    _last_alerted_sig = "WAIT"
+                elif _tp1 > 0 and price <= _tp1:
+                    tg("🎯 TP1 HIT SELL\nPrice: $" + sf(price) + "\nTP1: $" + sf(_tp1) + "\nProfit: ~$" + sf(abs(_last_alerted_price-price)*3) + "\nMove SL to breakeven. TP2: $" + sf(_tp2) + "\nagent.ceylonpropertylink.com")
+                    print("TP1 HIT sent")
+
+        except Exception as e:
+            short = str(e)[:200]
+            print("[SCHEDULER ERROR] " + short)
+            traceback.print_exc()
+            tg("❌ Analysis error:\n" + short + "\n" + now_str)
+
+        time.sleep(PHASE_A_SECS)
+
+
+# ═══════════════════════════════════════════════════════════════
+# [FIX-C] Rocket/Waterfall scheduler — now uses CANONICAL names
+# from trading_agent.py, no more _rw_alert_ts / _RW_COOLDOWN / _rw_entry_alerted
+# ═══════════════════════════════════════════════════════════════
+def rocket_scheduler():
+    global _rw_result, _rw_pre_alerted, _rw_alerted
+    global _rw_alert_dir, _rw_alert_time, _rw_alert_price
+    # PHASE 31: prediction alert state
+    _rw_imminent_last_dir = "NONE"
+    _rw_imminent_last_ts  = 0.0
+    _rw_b4_last_dir       = "NONE"
+    _rw_b4_last_ts        = 0.0
+    IMMINENT_COOLDOWN     = 300  # 5 min between imminent alerts same direction
+    B4_COOLDOWN           = 300  # 5 min between Brain 4 predicted alerts
+
+    import time as _t
+    _t.sleep(5)
+    print("[RW] Phase 30+31 Rocket scheduler started (1m bars, slope predictor, Brain 4)")
+    while True:
+        try:
+            live_p = _price_cache.get("price")
+            cache_age = _t.time() - _price_cache.get("ts", 0)
+            if not live_p or cache_age > 15:
+                try:
+                    _k = get_td_key()
+                    _r = req.get("https://api.twelvedata.com/price",
+                                 params={"symbol":"XAU/USD","apikey":_k}, timeout=5)
+                    _p = float(_r.json().get("price", 0))
+                    if _p > 100:
+                        live_p = round(_p, 2)
+                        _price_cache["price"] = live_p
+                        _price_cache["ts"]    = _t.time()
                 except Exception:
                     pass
-            if len(rows) < 30:
-                continue
-            df = pd.DataFrame(rows)
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            df = df.set_index("datetime").sort_index()
-            _rw_1m_cache    = df
-            _rw_1m_cache_ts = now
-            print(f"[RW] 1m bars loaded: {len(df)} via key {all_keys.index(key)+1}")
-            return df
+
+            result = run_rocket_analysis(live_p)
+            _rw_result = result
+
+            rocket    = result.get("rocket", 0)
+            waterfall = result.get("waterfall", 0)
+            signal    = result.get("signal", "WAIT")
+            price     = result.get("price", 0)
+            rsi       = result.get("rsi", 50)
+            atr       = result.get("atr", 13)
+            entry     = result.get("entry", price)
+            tp1       = result.get("tp1", 0)
+            tp2       = result.get("tp2", 0)
+            sl        = result.get("sl", 0)
+            # PHASE 31 fields
+            r_slope   = result.get("rocket_slope", 0)
+            w_slope   = result.get("waterfall_slope", 0)
+            r_eta     = result.get("rocket_eta_sec")
+            w_eta     = result.get("waterfall_eta_sec")
+            b4_r      = result.get("b4_rocket_prob", 0.0)
+            b4_w      = result.get("b4_waterfall_prob", 0.0)
+            b4_sig    = result.get("b4_signal")
+            b4_loaded = result.get("b4_loaded", False)
+            now_s     = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+            b4_tag = ""
+            if b4_loaded:
+                b4_tag = f" | B4={b4_r:.2f}"
+            print(f"[RW] 🚀{rocket} 💧{waterfall} | {signal} | ${sf(price)} | RSI={sf(rsi,1)} "
+                  f"| slope R{r_slope:+.1f}/W{w_slope:+.1f}{b4_tag}")
+
+            now_ts = _t.time()
+            cooldown_ok = (now_ts - _rw_alert_time) >= _RW_ENTRY_COOLDOWN
+            dir_flip    = (signal in ("ROCKET","WATERFALL") and
+                           signal.split("_")[0] != _rw_alert_dir.split("_")[0])
+
+            # ── [PHASE 31] BRAIN 4 PREDICTION ALERT (highest priority early warning) ──
+            if signal in ("ROCKET_PREDICTED", "WATERFALL_PREDICTED"):
+                b4_dir = "ROCKET" if "ROCKET" in signal else "WATERFALL"
+                b4_cooldown_ok = (now_ts - _rw_b4_last_ts) >= B4_COOLDOWN
+                b4_dir_change  = b4_dir != _rw_b4_last_dir
+
+                if b4_cooldown_ok or b4_dir_change:
+                    emoji   = "🔮🚀" if b4_dir == "ROCKET" else "🔮💧"
+                    dir_wrd = "BUY"  if b4_dir == "ROCKET" else "SELL"
+                    prob    = b4_r if b4_dir == "ROCKET" else b4_w
+
+                    tg(emoji + " BRAIN 4 PREDICTION — XAU/USD\n"
+                       + "━━━━━━━━━━━━━━━━━━━━\n"
+                       + "ML says " + dir_wrd + " momentum likely\n"
+                       + "within next 3 minutes\n"
+                       + "━━━━━━━━━━━━━━━━━━━━\n"
+                       + "Confidence: " + f"{prob*100:.0f}%\n"
+                       + "Current score: R=" + str(rocket) + " W=" + str(waterfall) + "\n"
+                       + "Price: $" + sf(price) + "  RSI: " + sf(rsi,1) + "\n"
+                       + "━━━━━━━━━━━━━━━━━━━━\n"
+                       + "Prepare entry — wait for full signal\n"
+                       + now_s + " | Phase 31 B4\n"
+                       + "agent.ceylonpropertylink.com")
+                    _rw_b4_last_dir = b4_dir
+                    _rw_b4_last_ts  = now_ts
+                    print(f"[RW] B4 PREDICTION sent: {dir_wrd} prob={prob:.2f}")
+
+            # ── [PHASE 31] SLOPE-BASED IMMINENT ALERT (fast, no ML needed) ──
+            elif signal in ("ROCKET_IMMINENT", "WATERFALL_IMMINENT"):
+                imm_dir = "ROCKET" if "ROCKET" in signal else "WATERFALL"
+                imm_cooldown_ok = (now_ts - _rw_imminent_last_ts) >= IMMINENT_COOLDOWN
+                imm_dir_change  = imm_dir != _rw_imminent_last_dir
+
+                if imm_cooldown_ok or imm_dir_change:
+                    emoji   = "⚠️🚀" if imm_dir == "ROCKET" else "⚠️💧"
+                    dir_wrd = "BUY"  if imm_dir == "ROCKET" else "SELL"
+                    score   = rocket if imm_dir == "ROCKET" else waterfall
+                    slope   = r_slope if imm_dir == "ROCKET" else w_slope
+                    eta     = r_eta if imm_dir == "ROCKET" else w_eta
+                    eta_str = f"~{int(eta)}s" if eta else "soon"
+
+                    tg(emoji + " " + imm_dir + " IMMINENT — XAU/USD\n"
+                       + "━━━━━━━━━━━━━━━━━━━━\n"
+                       + "Score: " + str(score) + "/100 (rising)\n"
+                       + "Slope: +" + sf(slope,1) + "/min\n"
+                       + "ETA to ignition: " + eta_str + "\n"
+                       + "━━━━━━━━━━━━━━━━━━━━\n"
+                       + "Price: $" + sf(price) + "  RSI: " + sf(rsi,1) + "\n"
+                       + "Pre-position: " + dir_wrd + "\n"
+                       + "Wait for ENTRY ALERT to fire\n"
+                       + now_s + " | Phase 31 Slope\n"
+                       + "agent.ceylonpropertylink.com")
+                    _rw_imminent_last_dir = imm_dir
+                    _rw_imminent_last_ts  = now_ts
+                    print(f"[RW] IMMINENT sent: {dir_wrd} score={score} slope={slope:+.1f}/min eta={eta_str}")
+
+            # PRE-ALERT (building) — only if no imminent/predicted already fired
+            elif signal in ("ROCKET_BUILDING","WATERFALL_BUILDING") and not _rw_pre_alerted:
+                emoji = "🚀" if "ROCKET" in signal else "💧"
+                score = rocket if "ROCKET" in signal else waterfall
+                mom_str = "🚀 Rocket: " if "ROCKET" in signal else "💧 Waterfall: "
+                tg(emoji + " MOMENTUM BUILDING — XAU/USD\n"
+                   + "━━━━━━━━━━━━━━━━━━━━\n"
+                   + mom_str + str(score) + "/100\n"
+                   + "Price: $" + sf(price) + "\n"
+                   + "RSI: " + sf(rsi,1) + "\n"
+                   + "━━━━━━━━━━━━━━━━━━━━\n"
+                   + "GET READY — Signal building\n"
+                   + "Watch for ENTRY ALERT\n"
+                   + now_s + " | agent.ceylonpropertylink.com")
+                _rw_pre_alerted = True
+                print(f"[RW] Pre-alert sent: {signal} {score}/100")
+
+            # ENTRY ALERT (actual ignition)
+            elif signal in ("ROCKET","WATERFALL") and (cooldown_ok or dir_flip):
+                emoji    = "⚡🚀" if signal == "ROCKET" else "⚡💧"
+                dir_word = "BUY" if signal == "ROCKET" else "SELL"
+                score    = rocket if signal == "ROCKET" else waterfall
+                max_slip = round(atr * 0.15, 2)
+                rr       = round(abs(tp1-entry)/abs(sl-entry),1) if abs(sl-entry)>0 else 0
+
+                mom_str2 = "🚀 Rocket: " if signal=="ROCKET" else "💧 Waterfall: "
+                tg(emoji + " " + dir_word + " NOW — XAU/USD\n"
+                   + "━━━━━━━━━━━━━━━━━━━━\n"
+                   + mom_str2 + str(score) + "/100  RSI: " + sf(rsi,1) + "\n"
+                   + "━━━━━━━━━━━━━━━━━━━━\n"
+                   + "Entry: $" + sf(entry) + "  (±$" + sf(max_slip) + ")\n"
+                   + "TP1  : $" + sf(tp1) + "  (+" + sf(abs(tp1-entry)) + ")\n"
+                   + "TP2  : $" + sf(tp2) + "  (+" + sf(abs(tp2-entry)) + ")\n"
+                   + "SL   : $" + sf(sl) + "  (-" + sf(abs(sl-entry)) + ")\n"
+                   + "━━━━━━━━━━━━━━━━━━━━\n"
+                   + "RR: 1:" + sf(rr,1) + "  ATR: $" + sf(atr) + "\n"
+                   + "Skip if price moved >$" + sf(max_slip) + "\n"
+                   + now_s + " | Phase 30 | agent.ceylonpropertylink.com")
+                _rw_alert_dir   = signal
+                _rw_alert_time  = now_ts
+                _rw_alert_price = price
+                _rw_alerted     = True
+                _rw_pre_alerted = False
+                print(f"[RW] ENTRY ALERT sent: {dir_word} ${sf(price)} R={rocket} W={waterfall}")
+
+            if signal == "WAIT" and _rw_pre_alerted:
+                _rw_pre_alerted = False
+                _rw_alerted     = False
+
         except Exception as e:
-            print(f"[RW] 1m fetch key error: {e}")
-    return None
+            print(f"[RW] Scheduler error: {str(e)[:150]}")
+            traceback.print_exc()
 
-# Legacy alias
-_fetch_5m_bars = _fetch_1m_bars
+        _t.sleep(60)
 
-def _calc_rocket_waterfall(df, live_price=None):
-    if df is None or len(df) < 20:
-        return 0, 0
-    close = df["close"].copy()
-    high  = df["high"].copy()
-    low   = df["low"].copy()
-    if live_price and live_price > 100:
-        close.iloc[-1] = live_price
-        high.iloc[-1]  = max(high.iloc[-1], live_price)
-        low.iloc[-1]   = min(low.iloc[-1],  live_price)
+threading.Thread(target=rocket_scheduler, daemon=True).start()
+print("[RW] Phase 30 Rocket/Waterfall scheduler thread launched — 60s interval")
 
-    delta = close.diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
-    rsi   = (100 - (100 / (1 + gain / (loss + 1e-9))))
-    rsi_now   = rsi.iloc[-1]
-    rsi_prev  = rsi.iloc[-3]
-    rsi_slope = rsi_now - rsi_prev
-
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    macd  = ema12 - ema26
-    sig9  = macd.ewm(span=9, adjust=False).mean()
-    hist  = macd - sig9
-    hist_now  = hist.iloc[-1]
-    hist_prev = hist.iloc[-3]
-    macd_rising  = hist_now > hist_prev and hist_now > 0
-    macd_falling = hist_now < hist_prev and hist_now < 0
-
-    ema9  = close.ewm(span=9,  adjust=False).mean()
-    ema21 = close.ewm(span=21, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
-    price_now = close.iloc[-1]
-    bull_ema = (price_now > ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1])
-    bear_ema = (price_now < ema9.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1])
-    price_above_ema9  = price_now > ema9.iloc[-1]
-    price_below_ema9  = price_now < ema9.iloc[-1]
-
-    tr   = pd.concat([high - low,
-                      (high - close.shift()).abs(),
-                      (low  - close.shift()).abs()], axis=1).max(axis=1)
-    atr  = tr.rolling(14).mean().iloc[-1]
-    body = abs(close.iloc[-1] - df["open"].iloc[-1])
-    momentum_candle = body > atr * 0.3
-
-    bb_mid = close.rolling(20).mean()
-    bb_std = close.rolling(20).std()
-    bb_up  = bb_mid + 2 * bb_std
-    bb_dn  = bb_mid - 2 * bb_std
-    bb_width_now  = (bb_up.iloc[-1]  - bb_dn.iloc[-1])
-    bb_width_prev = (bb_up.iloc[-5]  - bb_dn.iloc[-5])
-    bb_expanding = bb_width_now > bb_width_prev * 1.05
-
-    mom3 = close.iloc[-1] - close.iloc[-4]
-    mom3_bull = mom3 > atr * 0.2
-    mom3_bear = mom3 < -atr * 0.2
-
-    rocket = 0
-    if rsi_now < 30:                      rocket += 30
-    elif rsi_now < 40 and rsi_slope > 2:  rocket += 22
-    elif rsi_now < 50 and rsi_slope > 3:  rocket += 15
-    elif rsi_now < 55 and rsi_slope > 1:  rocket +=  8
-    if rsi_now > 70: rocket = min(rocket, 10)
-    if macd_rising:
-        rocket += 20
-        if hist_now > abs(hist_prev) * 1.2: rocket += 5
-    if bull_ema:          rocket += 20
-    elif price_above_ema9: rocket += 10
-    if bb_expanding and price_now > bb_mid.iloc[-1]: rocket += 10
-    if mom3_bull: rocket += 10
-    if momentum_candle and close.iloc[-1] > df["open"].iloc[-1]: rocket += 5
-    rocket = min(int(rocket), 100)
-
-    waterfall = 0
-    if rsi_now > 70:                        waterfall += 30
-    elif rsi_now > 60 and rsi_slope < -2:   waterfall += 22
-    elif rsi_now > 50 and rsi_slope < -3:   waterfall += 15
-    elif rsi_now > 45 and rsi_slope < -1:   waterfall +=  8
-    if rsi_now < 30: waterfall = min(waterfall, 10)
-    if macd_falling:
-        waterfall += 20
-        if hist_now < hist_prev * 1.2: waterfall += 5
-    if bear_ema:           waterfall += 20
-    elif price_below_ema9: waterfall += 10
-    if bb_expanding and price_now < bb_mid.iloc[-1]: waterfall += 10
-    if mom3_bear: waterfall += 10
-    if momentum_candle and close.iloc[-1] < df["open"].iloc[-1]: waterfall += 5
-    waterfall = min(int(waterfall), 100)
-
-    return rocket, waterfall
-
-
-def run_rocket_analysis(live_price=None):
-    global _rw_last_rocket, _rw_last_waterfall
-
-    session_quality, trade_allowed = _get_session_quality()
-    if not trade_allowed:
-        return {
-            "rocket": 0, "waterfall": 0,
-            "signal": "WAIT", "session_blocked": True,
-            "msg": "Off-hours — standby",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    df1 = _fetch_1m_bars()
-    if df1 is None:
-        return {"rocket": 0, "waterfall": 0, "signal": "ERROR", "msg": "No 1m data",
-                "timestamp": datetime.now(timezone.utc).isoformat()}
-
-    rocket, waterfall = _calc_rocket_waterfall(df1, live_price)
-    _rw_last_rocket    = rocket
-    _rw_last_waterfall = waterfall
-
-    price = live_price or float(df1["close"].iloc[-1])
-
-    tr  = pd.concat([
-        df1["high"] - df1["low"],
-        (df1["high"] - df1["close"].shift()).abs(),
-        (df1["low"]  - df1["close"].shift()).abs()
-    ], axis=1).max(axis=1)
-    atr_1m = float(tr.rolling(14).mean().iloc[-1])
-    # Scale 1min ATR up to H1-equivalent for TP/SL (1m ATR ~= 1/5 of H1 ATR)
-    atr    = max(atr_1m * 5, 8.0)
-
-    if rocket >= _RW_ENTRY_THRESHOLD:
-        signal = "ROCKET"
-        entry  = round(price, 2)
-        tp1    = round(price + atr * 1.2, 2)
-        tp2    = round(price + atr * 2.0, 2)
-        sl     = round(price - atr * 0.8, 2)
-    elif waterfall >= _RW_ENTRY_THRESHOLD:
-        signal = "WATERFALL"
-        entry  = round(price, 2)
-        tp1    = round(price - atr * 1.2, 2)
-        tp2    = round(price - atr * 2.0, 2)
-        sl     = round(price + atr * 0.8, 2)
-    elif rocket >= _RW_PRE_THRESHOLD:
-        signal = "ROCKET_BUILDING"
-        entry = tp1 = tp2 = sl = 0
-    elif waterfall >= _RW_PRE_THRESHOLD:
-        signal = "WATERFALL_BUILDING"
-        entry = tp1 = tp2 = sl = 0
-    else:
-        signal = "WAIT"
-        entry = tp1 = tp2 = sl = 0
-
-    delta = df1["close"].diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
-    rsi   = float((100 - (100 / (1 + gain / (loss + 1e-9)))).iloc[-1])
-
-    return {
-        "rocket":    rocket,
-        "waterfall": waterfall,
-        "signal":    signal,
-        "price":     round(price, 2),
-        "rsi":       round(rsi, 1),
-        "atr":       round(atr, 2),
-        "entry":     entry,
-        "tp1":       tp1,
-        "tp2":       tp2,
-        "sl":        sl,
-        "session":   session_quality,
-        "session_blocked": False,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "signal_time": datetime.now(timezone.utc).isoformat() if signal in ("ROCKET","WATERFALL") else None,
-    }
+threading.Thread(target=scheduler, daemon=True).start()
+print("Scheduler started — 2.5/5min dual-phase · Phase 30")
+print("Improvements: " + ("ENABLED ✅" if IMPROVEMENTS_LOADED else "DISABLED ⚠️"))
