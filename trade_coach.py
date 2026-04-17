@@ -44,12 +44,12 @@ STAGNANT_THRESHOLD   = 90 * 60           # 90 min of sideways = dead trade
 STAGNANT_RANGE_USD   = 3.0               # if price moves <$3 in 90min → dead
 DANGER_ZONE_RATIO    = 0.30              # SL warning when price within 30% of SL
 
-# Progress update frequency — 1 minute cadence
-PROGRESS_UPDATE_SEC  = 60                # every 1 min
+# Progress update frequency — 30 second cadence for faster trade monitoring
+PROGRESS_UPDATE_SEC  = 30                # every 30 sec (was 60)
 # But only alert if price moved meaningfully vs last update — skip micro-wiggles
-PROGRESS_MIN_MOVE    = 2.0               # USD — skip update if |Δprice| < this
+PROGRESS_MIN_MOVE    = 1.5               # USD — slightly lower than before (was 2.0) since 30s needs less move to matter
 # Exception: always alert if big move since last update (regardless of direction)
-PROGRESS_BIG_MOVE    = 5.0               # USD — "big" price move triggers alert even if close to prev
+PROGRESS_BIG_MOVE    = 4.0               # USD — "big" move threshold (was 5.0)
 
 # State values
 STATE_SCANNING     = "SCANNING"
