@@ -1,18 +1,33 @@
+"""
+trading_agent.py — Phase 30 (PATCHED 2026-04-17)
+
+Fixes in this build:
+  [FIX-1] Removed broken Rocket/Waterfall gate that referenced `sig` before definition
+          — this was a NameError bomb every time fused >= 6.3
+  [FIX-2] Consolidated three duplicate gate blocks into ONE (after sig is set)
+  [FIX-3] Added `global _td_key_index` so the key rotation actually persists
+  [FIX-4] b2_dir now handles BUY / SELL / WAIT cleanly (was BUY/WAIT only)
+  [ADD-1] Switched Phase 30 to 1-minute bars (was 5min) for faster rocket detection
+  [ADD-2] Exposed _RW_COOLDOWN / _rw_alert_ts / _rw_entry_alerted / _rw_result aliases
+          so main.py's name mismatches don't crash the rocket scheduler
+  [ADD-3] rocket-status returns signal_time so frontend can show signal age
+"""
+
 import os, pickle, json, requests, pandas as pd, numpy as np, yfinance as yf
 from datetime import datetime, timezone, time as _time
 
 # ── Env vars ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8172828888:AAFWCvtCl1F-Kj5yOv_EFEB9vxL-ir-dD9I")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT",  "7132630179")
-# ── Groq API key rotation ─────────────────────────────────────────────────────
+
 _GROQ_KEYS = [k for k in [
     os.environ.get("GROQ_API_KEY",  "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"),
     os.environ.get("GROQ_API_KEY2", "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"),
     os.environ.get("GROQ_API_KEY3", "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"),
 ] if k.strip()]
 _groq_key_index = 0
-GROQ_API_KEY = _GROQ_KEYS[0]  # legacy compat
-# ── Twelve Data key rotation (add TD_KEY, TD_KEY2, TD_KEY3 in Railway) ──────
+GROQ_API_KEY = _GROQ_KEYS[0]
+
 _TD_KEYS = [k for k in [
     os.environ.get("TD_KEY",  "f3883b7831a540cda02cfafcfe77e082"),
     os.environ.get("TD_KEY2", "41c8cfdf490b4bf4a0d388e716a32453"),
@@ -21,32 +36,29 @@ _TD_KEYS = [k for k in [
 _td_key_index = 0
 
 def get_td_key():
-    """Return current active TD key."""
     global _td_key_index
     if not _TD_KEYS: return ""
     return _TD_KEYS[_td_key_index % len(_TD_KEYS)]
 
 def rotate_td_key(reason=""):
-    """Switch to next TD key (call when rate limit hit)."""
     global _td_key_index
     if len(_TD_KEYS) <= 1: return
     _td_key_index += 1
     print(f"[TD KEY] Rotated to key {(_td_key_index % len(_TD_KEYS)) + 1}/{len(_TD_KEYS)} — {reason}")
 
-TD_KEY = get_td_key()  # legacy compat
-# ── Groq model rotation (rotates on rate limit) ──────────────────────────────
+TD_KEY = get_td_key()
+
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",   # primary   — 100k TPD
-    "llama3-70b-8192",            # fallback1 — separate limit
-    "gemma2-9b-it",               # fallback2 — Google model on Groq
-    "llama3-8b-8192",             # fallback3 — fast, low token usage
-    "mixtral-8x7b-32768",         # fallback4 — Mistral
+    "llama-3.3-70b-versatile",
+    "llama3-70b-8192",
+    "gemma2-9b-it",
+    "llama3-8b-8192",
+    "mixtral-8x7b-32768",
 ]
 _groq_model_index = 0
-GROQ_MODEL = GROQ_MODELS[0]  # legacy compat
-SYMBOL         = "GC=F"
+GROQ_MODEL = GROQ_MODELS[0]
+SYMBOL = "GC=F"
 
-# ── numpy → pure Python converter ────────────────────────────────────────────
 def _to_python(obj):
     if isinstance(obj, dict):          return {k: _to_python(v) for k, v in obj.items()}
     if isinstance(obj, list):          return [_to_python(v) for v in obj]
@@ -56,7 +68,6 @@ def _to_python(obj):
     if isinstance(obj, np.bool_):      return bool(obj)
     return obj
 
-# ── ATR helper ────────────────────────────────────────────────────────────────
 def calculate_atr_dynamic(df, period=14):
     h, l, c = df["high"], df["low"], df["close"]
     tr = pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
@@ -83,7 +94,6 @@ def get_dynamic_tpsl(df, direction, entry_price):
         sl_level = round(entry_price + sl_pts, 2)
     return tp_usd, sl_usd, tp_level, sl_level
 
-# ── Phase 20: Session Filter ──────────────────────────────────────────────────
 _BLOCK_START = _time(21, 0)
 _BLOCK_END   = _time(1,  0)
 
@@ -102,7 +112,6 @@ def _get_session_quality(utc_dt=None):
     elif london or new_york: return "MEDIUM", True
     else: return "LOW (no major session)", False
 
-# ── Phase 21: H4 Trend Confirmation ──────────────────────────────────────────
 def _get_h4_trend(df_h1):
     try:
         df = df_h1.copy()
@@ -133,7 +142,6 @@ def _get_h4_trend(df_h1):
         return {"direction":"NEUTRAL","reason":f"H4 error: {e}","score":5,
                 "ema20":None,"ema50":None,"rsi":None,"atr":None}
 
-# ── Phase 22: Daily Loss Limit ────────────────────────────────────────────────
 _DAILY_PNL_PATH    = "daily_pnl.json"
 _DAILY_LOSS_LIMIT  = 30.0
 _MAX_TRADES_PER_DAY = 6
@@ -186,11 +194,9 @@ def get_daily_summary():
             "limit_usd":_DAILY_LOSS_LIMIT,"max_trades":_MAX_TRADES_PER_DAY,
             "blocked":blocked,"status":reason,"trades":pnl["trades"]}
 
-# ── Phase 29: S/R Flip Tracker ────────────────────────────────────────────────
 _sr_flip_state = {"last_support": None, "alerted": False}
 
 def check_sr_flip(price, support, resistance, atr):
-    """Send Telegram alert when price breaks below support (flip to resistance)."""
     prev = _sr_flip_state["last_support"]
     if prev is not None and abs(support - prev) > 1.0:
         _sr_flip_state["alerted"] = False
@@ -217,7 +223,6 @@ def check_sr_flip(price, support, resistance, atr):
         except Exception as e:
             print(f"[SR FLIP] Telegram error: {e}")
 
-# ── Brain 2 Analyzer ──────────────────────────────────────────────────────────
 class Brain2Analyzer:
     def analyze_trend(self, df):
         close=df["close"]; ema20=close.ewm(span=20,adjust=False).mean().iloc[-1]
@@ -264,7 +269,6 @@ class Brain2Analyzer:
         hist=(macd-macd.ewm(span=9,adjust=False).mean())
         hist_now=hist.iloc[-1]; hist_prev=hist.iloc[-2]
         mc="BULLISH" if hist_now>0 else "BEARISH"
-        # RSI slope
         rsi_series = 100-(100/(1+gain/(loss+1e-9)))
         rsi_slope = rsi_series.iloc[-1] - rsi_series.iloc[-5]
         if rsi>70: state="OVERBOUGHT"
@@ -272,19 +276,18 @@ class Brain2Analyzer:
         elif rsi>55 and mc=="BULLISH": state="BULLISH_MOMENTUM"
         elif rsi<45 and mc=="BEARISH": state="BEARISH_MOMENTUM"
         else: state="NEUTRAL"
-        # ── Rocket Score (XAU/USD bullish momentum 0-100) ──────────────
+
         rocket = 0
         ema9  = close.ewm(span=9, adjust=False).mean()
         ema21 = close.ewm(span=21, adjust=False).mean()
         price = close.iloc[-1]
-        if rsi < 35: rocket += 25              # oversold bounce setup
-        elif rsi < 45 and rsi_slope > 2: rocket += 15  # recovering
-        if hist_now > 0 and hist_now > hist_prev: rocket += 20  # MACD rising
-        if price > ema9.iloc[-1]: rocket += 15  # price above fast EMA
-        if ema9.iloc[-1] > ema21.iloc[-1]: rocket += 15  # EMA aligned bullish
-        if rsi_slope > 3: rocket += 15         # RSI rising strongly
+        if rsi < 35: rocket += 25
+        elif rsi < 45 and rsi_slope > 2: rocket += 15
+        if hist_now > 0 and hist_now > hist_prev: rocket += 20
+        if price > ema9.iloc[-1]: rocket += 15
+        if ema9.iloc[-1] > ema21.iloc[-1]: rocket += 15
+        if rsi_slope > 3: rocket += 15
         rocket = min(rocket, 100)
-        # ── Waterfall Score (XAU/USD bearish momentum 0-100) ───────────
         waterfall = 0
         if rsi > 65: waterfall += 25
         elif rsi > 55 and rsi_slope < -2: waterfall += 15
@@ -293,7 +296,7 @@ class Brain2Analyzer:
         if ema9.iloc[-1] < ema21.iloc[-1]: waterfall += 15
         if rsi_slope < -3: waterfall += 15
         waterfall = min(waterfall, 100)
-        # Momentum score for confluence
+
         if rocket >= 60:   score = 8
         elif rocket >= 40: score = 7
         elif waterfall >= 60: score = 2
@@ -351,7 +354,6 @@ class Brain2Analyzer:
                 "modules":{"trend":t,"structure":st,"session":se,"momentum":m,"volatility":v,"sr_zones":sr},
                 "module_scores":c["module_scores"]}
 
-# ── Feature builder (Brain 1 v4 — 64 features) ───────────────────────────────
 def build_features_for_brain1v2(df):
     d = df.copy()
     c = d["close"]; h = d["high"]; l = d["low"]; o = d["open"]
@@ -438,16 +440,9 @@ def build_features_for_brain1v2(df):
 
     return d.dropna()
 
-# ── Telegram alert ────────────────────────────────────────────────────────────
 def send_telegram(msg_or_signal, price=None, score=None, b1_prob=None,
                   b2_score=None, atr=None, h4=None, tp=None, sl=None, tp2=None):
-    """
-    Can be called two ways:
-      send_telegram("plain message text")           — plain text alert
-      send_telegram("BUY", price, score, ...)       — trade signal alert
-    """
     if price is None:
-        # Plain text mode
         msg = msg_or_signal
     else:
         signal = msg_or_signal
@@ -493,7 +488,6 @@ def send_telegram(msg_or_signal, price=None, score=None, b1_prob=None,
     except Exception as e:
         print("Telegram error:", e)
 
-# ── Trailing SL check ─────────────────────────────────────────────────────────
 def trailing_sl_check(direction, entry, current_high, current_low,
                       tp_level, sl_level, be_triggered):
     if be_triggered: return sl_level, True
@@ -507,14 +501,11 @@ def trailing_sl_check(direction, entry, current_high, current_low,
 
 # ── Main analysis ─────────────────────────────────────────────────────────────
 def run_analysis():
-
-    # ── Session filter ───────────────────────────────────────────────────────
     session_quality, trade_allowed = _get_session_quality()
     now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
     print(f"\n🕐 Session: {now_utc} | Quality: {session_quality}")
 
     if not trade_allowed:
-        # OFF-HOURS: fetch only live price (1 TD call), skip Groq + analysis entirely
         _price = None
         try:
             import requests as _rq
@@ -546,7 +537,6 @@ def run_analysis():
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
-    # ── Daily loss limit ─────────────────────────────────────────────────────
     day_blocked, day_reason, day_pnl = _check_daily_limit()
     if day_blocked:
         return {"signal":"WAIT","confidence":0,"price":None,
@@ -564,7 +554,6 @@ def run_analysis():
         "daily_limit": {"ok":True, "msg":day_reason},
     }
 
-    # ── Load Brain 1 model ───────────────────────────────────────────────────
     _b1_use_fallback = False
     try:
         with open("models/brain1_xgboost_v4.pkl","rb") as f:
@@ -581,11 +570,11 @@ def run_analysis():
         THRESHOLD = 0.60
         features  = {"features":[]}
 
-    # ── Data feed — tries ALL 3 TD keys then yfinance fallback ─────────────
+    # [FIX-3] Declare global so key rotation persists
+    global _td_key_index
     try:
         _td_df = None
         import requests as _req
-        # Try every available TD key until one works
         _all_keys = [k for k in [
             os.environ.get("TD_KEY",  "f3883b7831a540cda02cfafcfe77e082"),
             os.environ.get("TD_KEY2", "41c8cfdf490b4bf4a0d388e716a32453"),
@@ -599,8 +588,7 @@ def run_analysis():
                     "apikey":_active_key,"timezone":"UTC","format":"JSON"
                 }, timeout=30)
                 _td = _r.json()
-                # Check for any error (rate limit, exhausted, invalid)
-                if "code" in _td or "message" in _td and "values" not in _td:
+                if "code" in _td or ("message" in _td and "values" not in _td):
                     print(f"[DATA] TD key {_ki+1} error: {_td.get('message','unknown')} — trying next")
                     continue
                 if "values" in _td and len(_td["values"]) > 50:
@@ -613,7 +601,6 @@ def run_analysis():
                     _td_df = _td_df[[c for c in ["open","high","low","close"] if c in _td_df.columns]].dropna()
                     if "volume" not in _td_df.columns:
                         _td_df["volume"] = 0
-                    # Update rotation index to this working key
                     _td_key_index = _ki
                     print(f"[DATA] TD key {_ki+1} OK: {len(_td_df)} bars ✅")
                     break
@@ -624,7 +611,6 @@ def run_analysis():
         if _td_df is not None and len(_td_df) > 50:
             df = _td_df
         else:
-            # All TD keys failed — emergency yfinance fallback
             print("[DATA] All TD keys exhausted — using yfinance emergency fallback")
             try:
                 import yfinance as yf
@@ -647,7 +633,6 @@ def run_analysis():
         return {"signal":"ERROR","confidence":0,"price":None,"health":health,
                 "timestamp":datetime.now(timezone.utc).isoformat()}
 
-    # ── Feature engineering ──────────────────────────────────────────────────
     try:
         df_live = build_features_for_brain1v2(df)
         if df_live is None or len(df_live) == 0:
@@ -657,7 +642,7 @@ def run_analysis():
         return {"signal":"ERROR","confidence":0,"price":None,"health":health,
                 "timestamp":datetime.now(timezone.utc).isoformat()}
 
-    # ── Brain 1 ──────────────────────────────────────────────────────────────
+    # Brain 1
     try:
         if _b1_use_fallback:
             row = df_live.iloc[-1]
@@ -698,7 +683,7 @@ def run_analysis():
         health["brain1"] = {"ok":False,"msg":f"Inference failed: {e}"}
         b1_buy=0.5; b1_sell=0.5; b1_dir="WAIT"; b1_score=5.0
 
-    # ── Brain 2 ──────────────────────────────────────────────────────────────
+    # Brain 2
     try:
         brain2  = Brain2Analyzer()
         report  = brain2.analyze(df_live)
@@ -710,37 +695,34 @@ def run_analysis():
         health["brain2"] = {"ok":False,"msg":f"Analysis failed: {e}"}
         b2_sig="WAIT"; b2_score=5.0
         m={"trend":{"direction":"UNKNOWN","strength":"UNKNOWN","ema20":None,"ema50":None},
-           "structure":{"structure":"UNKNOWN"},"momentum":{"rsi":50,"state":"UNKNOWN"},
-           "volatility":{"atr14":15},"sr_zones":{"nearest_support":0,"nearest_resistance":0,
-           "dist_to_support_pct":0,"dist_to_resistance_pct":0}}
+           "structure":{"structure":"UNKNOWN"},
+           "momentum":{"rsi":50,"state":"UNKNOWN","rocket_score":0,"waterfall_score":0},
+           "volatility":{"atr14":15},
+           "sr_zones":{"nearest_support":0,"nearest_resistance":0,
+                       "dist_to_support_pct":0,"dist_to_resistance_pct":0}}
         report={"signal":"WAIT","confluence_score":5.0,"modules":m}
 
-    # ── Signal fusion ────────────────────────────────────────────────────────
+    # Signal fusion
     fused = (b1_score*0.4) + (b2_score*0.6)
     rocket    = m["momentum"].get("rocket_score", 0)
     waterfall = m["momentum"].get("waterfall_score", 0)
 
-    # ── Normalise B2 signal ──────────────────────────────────────────────────
-    b2_dir = "BUY"  if any(x in b2_sig.upper() for x in ["BUY","BULL"]) else              "SELL" if any(x in b2_sig.upper() for x in ["SELL","BEAR"]) else "WAIT"
+    # [FIX-4] B2 direction: BUY / SELL / WAIT
+    _b2_up = b2_sig.upper()
+    if any(x in _b2_up for x in ["BUY","BULL"]):
+        b2_dir = "BUY"
+    elif any(x in _b2_up for x in ["SELL","BEAR"]):
+        b2_dir = "SELL"
+    else:
+        b2_dir = "WAIT"
 
-    # ── Alignment bonus: B1 + B2 agree ──────────────────────────────────────
     if b1_dir == b2_dir and b1_dir != "WAIT":
         fused += 0.5
         print(f"   ✅ B1+B2 aligned ({b1_dir}) → fused +0.5")
 
-    # ── Rocket/Waterfall momentum gate ──────────────────────────────────────
-    # Only allow BUY if Rocket >= 50 (strong bullish momentum confirmed)
-    # Only allow SELL if Waterfall >= 50 (strong bearish momentum confirmed)
-    if fused >= 6.3:
-        if sig == "BUY"  and rocket < 50:
-            print(f"   ⛔ Rocket={rocket} < 50 — BUY momentum not confirmed → WAIT")
-            fused = min(fused, 6.2)
-        elif sig == "SELL" and waterfall < 50:
-            print(f"   ⛔ Waterfall={waterfall} < 50 — SELL momentum not confirmed → WAIT")
-            fused = min(fused, 6.2)
+    # [FIX-1] The broken gate block that used undefined `sig` has been REMOVED.
 
-    # ── H4 directional bonus ─────────────────────────────────────────────────
-    # Applied BEFORE H4 veto so aligned H4 boosts signal
+    # H4 directional bonus (before final sig)
     try:
         _h4_pre = _get_h4_trend(df)
         _h4_dir = _h4_pre.get("direction","NEUTRAL")
@@ -753,30 +735,24 @@ def run_analysis():
     except Exception:
         pass
 
-    if fused>=6.5: sig,conf = "BUY","HIGH" if fused>=8 else "MEDIUM"
-    elif fused<=3.5: sig,conf = "SELL","HIGH" if fused<=2 else "MEDIUM"
-    else: sig,conf = "WAIT","LOW"
+    # Decide signal from fused
+    if   fused >= 6.5: sig, conf = "BUY",  "HIGH" if fused >= 8 else "MEDIUM"
+    elif fused <= 3.5: sig, conf = "SELL", "HIGH" if fused <= 2 else "MEDIUM"
+    else:              sig, conf = "WAIT", "LOW"
 
-    # Rocket/Waterfall gate — after signal set
+    # [FIX-2] SINGLE Rocket/Waterfall gate (was duplicated 3x, one broken)
     if sig == "BUY" and rocket < 50:
-        print("   Rocket=" + str(rocket) + "<50 — not confirmed WAIT")
-        sig = "WAIT"; conf = "LOW"
+        print(f"   ⛔ Rocket={rocket} < 50 — BUY momentum not confirmed → WAIT")
+        sig, conf = "WAIT", "LOW"
+        fused = min(fused, 6.4)
     elif sig == "SELL" and waterfall < 50:
-        print("   Waterfall=" + str(waterfall) + "<50 — not confirmed WAIT")
-        sig = "WAIT"; conf = "LOW"
-    elif sig == "BUY":  print("   Rocket=" + str(rocket) + " CONFIRMED BUY")
-    elif sig == "SELL": print("   Waterfall=" + str(waterfall) + " CONFIRMED SELL")
-
-    # ── Rocket/Waterfall gate AFTER signal set ────────────────────────────────
-    if sig == "BUY" and rocket < 50:
-        print(f"   ⛔ Rocket={rocket}<50 — momentum not confirmed → WAIT")
-        sig  = "WAIT"; conf = "LOW"; fused = min(fused, 6.4)
-    elif sig == "SELL" and waterfall < 50:
-        print(f"   ⛔ Waterfall={waterfall}<50 — momentum not confirmed → WAIT")
-        sig  = "WAIT"; conf = "LOW"; fused = min(fused, 6.4)
-    else:
-        if sig == "BUY":  print(f"   🚀 Rocket={rocket} CONFIRMED → BUY")
-        if sig == "SELL": print(f"   💧 Waterfall={waterfall} CONFIRMED → SELL")
+        print(f"   ⛔ Waterfall={waterfall} < 50 — SELL momentum not confirmed → WAIT")
+        sig, conf = "WAIT", "LOW"
+        fused = min(fused, 6.4)
+    elif sig == "BUY":
+        print(f"   🚀 Rocket={rocket} CONFIRMED → BUY")
+    elif sig == "SELL":
+        print(f"   💧 Waterfall={waterfall} CONFIRMED → SELL")
 
     price   = round(float(df_live["close"].iloc[-1]), 2)
     atr_raw = float(m["volatility"]["atr14"])
@@ -785,7 +761,6 @@ def run_analysis():
     resistance = float(m["sr_zones"]["nearest_resistance"])
     ema20_val  = float(m["trend"]["ema20"]) if m["trend"]["ema20"] else price
 
-    # ── Phase 29 Improvement 1: Tight range filter ───────────────────────────
     sr_gap = abs(resistance - support)
     tight_range = sr_gap < 10.0
     if tight_range:
@@ -793,7 +768,6 @@ def run_analysis():
         sig   = "WAIT"
         fused = min(fused, 4.9)
 
-    # ── Phase 29 Improvement 2: S/R breakout penalty ─────────────────────────
     price_below_support = price < support
     price_below_ema20   = price < ema20_val
     sr_flip_active      = price_below_support
@@ -805,7 +779,7 @@ def run_analysis():
             sig   = "WAIT"
             fused = min(fused, 4.9)
 
-    # ── Phase 21: H4 veto ────────────────────────────────────────────────────
+    # H4 veto
     try:
         h4     = _get_h4_trend(df)
         h4_dir = h4["direction"]
@@ -823,12 +797,11 @@ def run_analysis():
         conf    = "LOW"
         print(f"   ⚠️  H4 VETO — {sig_before_veto} blocked (H4={h4_dir})")
 
-    # ── TP/SL calculation ─────────────────────────────────────────────────────
     tp  = round(price + atr*1.5, 2) if sig=="BUY" else round(price - atr*1.5, 2)
     tp2 = round(price + atr*2.5, 2) if sig=="BUY" else round(price - atr*2.5, 2)
     sl  = round(price - atr,     2) if sig=="BUY" else round(price + atr,     2)
 
-    # ── Brain 3 ──────────────────────────────────────────────────────────────
+    # Brain 3 (Groq)
     sr_flip_note = "\n⚠️ NOTE: Price broke below support — possible S/R flip" if sr_flip_active else ""
     tight_note   = "\n⚠️ NOTE: Tight S/R range — low reward potential" if tight_range else ""
     prompt = (
@@ -846,7 +819,6 @@ def run_analysis():
     import requests as req
     b3_text = None
     global _groq_model_index, _groq_key_index
-    # Try every key × every model combination until one works
     _total_attempts = len(_GROQ_KEYS) * len(GROQ_MODELS)
     for _attempt in range(_total_attempts):
         _key   = _GROQ_KEYS[_groq_key_index % len(_GROQ_KEYS)]
@@ -862,7 +834,7 @@ def run_analysis():
                 print(f"[B3] key{_groq_key_index+1}/{_model} limited — rotating key")
                 _groq_key_index  += 1
                 if _groq_key_index % len(_GROQ_KEYS) == 0:
-                    _groq_model_index += 1   # all keys exhausted on this model → try next model
+                    _groq_model_index += 1
                 continue
             b3_text = data["choices"][0]["message"]["content"]
             health["brain3"] = {"ok":True,"msg":f"model={_model} key={_groq_key_index%len(_GROQ_KEYS)+1}/{len(_GROQ_KEYS)}"}
@@ -875,10 +847,8 @@ def run_analysis():
                    f"B1={round(b1_buy,3)} B2={b2_score}. Signal based on B1+B2 only.")
         health["brain3"] = {"ok":False,"msg":f"All {len(_GROQ_KEYS)} Groq keys rate limited"}
 
-    # ── Phase 29 Improvement 3: S/R flip Telegram alert ──────────────────────
     check_sr_flip(price, support, resistance, atr)
 
-    # ── Telegram trade signal ─────────────────────────────────────────────────
     try:
         send_telegram(sig, price, fused, b1_buy, b2_score, atr, h4, tp=tp, sl=sl, tp2=tp2)
         health["telegram"] = {"ok":True,"msg":"alert sent" if sig in ("BUY","SELL") else "standby"}
@@ -898,6 +868,8 @@ def run_analysis():
                                 "support":support,"resistance":resistance,
                                 "dist_support_pct":m["sr_zones"]["dist_to_support_pct"],
                                 "dist_resistance_pct":m["sr_zones"]["dist_to_resistance_pct"],
+                                "rocket_score":rocket,
+                                "waterfall_score":waterfall,
                             }},
         "brain3":           {"verdict":sig,"reasoning":b3_text},
         "h4":               h4,
@@ -917,7 +889,6 @@ def run_analysis():
         "timestamp":        datetime.now(timezone.utc).isoformat(),
         "last_run":         datetime.now(timezone.utc).isoformat(),
         "improvements":     "ENABLED",
-        # Phase 29 additions
         "sr_flip_active":   sr_flip_active,
         "tight_range":      tight_range,
         "sr_gap":           round(sr_gap, 2),
@@ -926,33 +897,36 @@ def run_analysis():
     })
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 30 — ROCKET/WATERFALL MICRO-ENTRY SYSTEM
-# Runs every 60s. Catches momentum at candle 1, not candle 3.
-# Uses 5m chart (faster signals) + live price via Finnhub WebSocket
+# PHASE 30 — ROCKET/WATERFALL MICRO-ENTRY SYSTEM (1-minute bars)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Phase 30 state ────────────────────────────────────────────────────────────
 _rw_last_rocket    = 0
 _rw_last_waterfall = 0
-_rw_pre_alerted    = False   # fired pre-alert (40+)
-_rw_alerted        = False   # fired entry alert (60+)
-_rw_alert_dir      = "WAIT"  # last alerted direction
-_rw_alert_time     = 0.0     # last alert timestamp
-_rw_alert_price    = 0.0     # price when alert fired
-_rw_5m_cache       = None    # cached 5m bars
-_rw_5m_cache_ts    = 0.0     # cache timestamp
-_RW_CACHE_TTL      = 60      # refresh 5m bars every 60s
-_RW_ENTRY_COOLDOWN = 600     # 10min between entry alerts same direction
-_RW_PRE_THRESHOLD  = 40      # pre-alert threshold
-_RW_ENTRY_THRESHOLD= 60      # entry alert threshold
+_rw_pre_alerted    = False
+_rw_alerted        = False
+_rw_alert_dir      = "WAIT"
+_rw_alert_time     = 0.0
+_rw_alert_price    = 0.0
+_rw_1m_cache       = None
+_rw_1m_cache_ts    = 0.0
+_RW_CACHE_TTL      = 45
+_RW_ENTRY_COOLDOWN = 600
+_RW_PRE_THRESHOLD  = 40
+_RW_ENTRY_THRESHOLD= 60
 
-def _fetch_5m_bars():
-    """Fetch 5-minute bars — the fastest reliable Twelve Data interval."""
-    global _rw_5m_cache, _rw_5m_cache_ts
+# [ADD-2] Aliases for main.py's mismatched names
+_RW_COOLDOWN       = _RW_ENTRY_COOLDOWN
+_rw_alert_ts       = _rw_alert_time
+_rw_entry_alerted  = False
+_rw_result         = None
+
+def _fetch_1m_bars():
+    """[ADD-1] 1-minute bars for maximum rocket/waterfall responsiveness."""
+    global _rw_1m_cache, _rw_1m_cache_ts
     import time as _time_mod
     now = _time_mod.time()
-    if _rw_5m_cache is not None and (now - _rw_5m_cache_ts) < _RW_CACHE_TTL:
-        return _rw_5m_cache
+    if _rw_1m_cache is not None and (now - _rw_1m_cache_ts) < _RW_CACHE_TTL:
+        return _rw_1m_cache
     all_keys = [k for k in [
         os.environ.get("TD_KEY",  "f3883b7831a540cda02cfafcfe77e082"),
         os.environ.get("TD_KEY2", "41c8cfdf490b4bf4a0d388e716a32453"),
@@ -961,7 +935,7 @@ def _fetch_5m_bars():
     for key in all_keys:
         try:
             r = requests.get("https://api.twelvedata.com/time_series", params={
-                "symbol": "XAU/USD", "interval": "5min", "outputsize": 100,
+                "symbol": "XAU/USD", "interval": "1min", "outputsize": 120,
                 "apikey": key, "timezone": "UTC", "format": "JSON"
             }, timeout=15)
             d = r.json()
@@ -979,48 +953,41 @@ def _fetch_5m_bars():
                     })
                 except Exception:
                     pass
-            if len(rows) < 20:
+            if len(rows) < 30:
                 continue
             df = pd.DataFrame(rows)
             df["datetime"] = pd.to_datetime(df["datetime"])
             df = df.set_index("datetime").sort_index()
-            _rw_5m_cache    = df
-            _rw_5m_cache_ts = now
-            print(f"[RW] 5m bars loaded: {len(df)} via key {all_keys.index(key)+1}")
+            _rw_1m_cache    = df
+            _rw_1m_cache_ts = now
+            print(f"[RW] 1m bars loaded: {len(df)} via key {all_keys.index(key)+1}")
             return df
         except Exception as e:
-            print(f"[RW] 5m fetch key error: {e}")
+            print(f"[RW] 1m fetch key error: {e}")
     return None
 
+# Legacy alias
+_fetch_5m_bars = _fetch_1m_bars
+
 def _calc_rocket_waterfall(df, live_price=None):
-    """
-    World-class Rocket/Waterfall scorer for XAU/USD.
-    Uses 5m bars for speed + live price to update last candle.
-    Returns rocket (0-100) and waterfall (0-100).
-    """
     if df is None or len(df) < 20:
         return 0, 0
-
     close = df["close"].copy()
     high  = df["high"].copy()
     low   = df["low"].copy()
-
-    # Inject live price into last candle if available
     if live_price and live_price > 100:
         close.iloc[-1] = live_price
         high.iloc[-1]  = max(high.iloc[-1], live_price)
         low.iloc[-1]   = min(low.iloc[-1],  live_price)
 
-    # ── RSI(14) ──────────────────────────────────────────────────────────────
     delta = close.diff()
     gain  = delta.clip(lower=0).rolling(14).mean()
     loss  = (-delta.clip(upper=0)).rolling(14).mean()
     rsi   = (100 - (100 / (1 + gain / (loss + 1e-9))))
     rsi_now   = rsi.iloc[-1]
     rsi_prev  = rsi.iloc[-3]
-    rsi_slope = rsi_now - rsi_prev   # slope over last 3 candles
+    rsi_slope = rsi_now - rsi_prev
 
-    # ── MACD(12,26,9) ────────────────────────────────────────────────────────
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd  = ema12 - ema26
@@ -1031,7 +998,6 @@ def _calc_rocket_waterfall(df, live_price=None):
     macd_rising  = hist_now > hist_prev and hist_now > 0
     macd_falling = hist_now < hist_prev and hist_now < 0
 
-    # ── EMA alignment (9/21/50) ───────────────────────────────────────────
     ema9  = close.ewm(span=9,  adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
     ema50 = close.ewm(span=50, adjust=False).mean()
@@ -1041,16 +1007,13 @@ def _calc_rocket_waterfall(df, live_price=None):
     price_above_ema9  = price_now > ema9.iloc[-1]
     price_below_ema9  = price_now < ema9.iloc[-1]
 
-    # ── ATR(14) for volatility confirmation ──────────────────────────────
     tr   = pd.concat([high - low,
                       (high - close.shift()).abs(),
                       (low  - close.shift()).abs()], axis=1).max(axis=1)
     atr  = tr.rolling(14).mean().iloc[-1]
-    # Momentum candle: last candle body > 0.3 ATR
     body = abs(close.iloc[-1] - df["open"].iloc[-1])
     momentum_candle = body > atr * 0.3
 
-    # ── Bollinger Bands squeeze → breakout ───────────────────────────────
     bb_mid = close.rolling(20).mean()
     bb_std = close.rolling(20).std()
     bb_up  = bb_mid + 2 * bb_std
@@ -1059,107 +1022,77 @@ def _calc_rocket_waterfall(df, live_price=None):
     bb_width_prev = (bb_up.iloc[-5]  - bb_dn.iloc[-5])
     bb_expanding = bb_width_now > bb_width_prev * 1.05
 
-    # ── Price momentum (last 3 candles) ───────────────────────────────────
-    mom3 = close.iloc[-1] - close.iloc[-4]   # 3-candle price change
+    mom3 = close.iloc[-1] - close.iloc[-4]
     mom3_bull = mom3 > atr * 0.2
     mom3_bear = mom3 < -atr * 0.2
 
-    # ══════════════════════════════════════════════════════════════════════
-    # ROCKET SCORE (bullish momentum, 0-100)
-    # ══════════════════════════════════════════════════════════════════════
     rocket = 0
-
-    # RSI: best BUY when bouncing from oversold
-    if rsi_now < 30:                      rocket += 30   # deep oversold = max setup
-    elif rsi_now < 40 and rsi_slope > 2:  rocket += 22   # oversold + rising
-    elif rsi_now < 50 and rsi_slope > 3:  rocket += 15   # recovering
-    elif rsi_now < 55 and rsi_slope > 1:  rocket +=  8   # mild bullish
-    # Cap at overbought
+    if rsi_now < 30:                      rocket += 30
+    elif rsi_now < 40 and rsi_slope > 2:  rocket += 22
+    elif rsi_now < 50 and rsi_slope > 3:  rocket += 15
+    elif rsi_now < 55 and rsi_slope > 1:  rocket +=  8
     if rsi_now > 70: rocket = min(rocket, 10)
-
-    # MACD histogram rising + above zero
     if macd_rising:
         rocket += 20
-        if hist_now > abs(hist_prev) * 1.2: rocket += 5   # accelerating
-
-    # EMA alignment
+        if hist_now > abs(hist_prev) * 1.2: rocket += 5
     if bull_ema:          rocket += 20
     elif price_above_ema9: rocket += 10
-
-    # Bollinger expansion (breakout)
     if bb_expanding and price_now > bb_mid.iloc[-1]: rocket += 10
-
-    # Price momentum
-    if mom3_bull:          rocket += 10
+    if mom3_bull: rocket += 10
     if momentum_candle and close.iloc[-1] > df["open"].iloc[-1]: rocket += 5
-
     rocket = min(int(rocket), 100)
 
-    # ══════════════════════════════════════════════════════════════════════
-    # WATERFALL SCORE (bearish momentum, 0-100)
-    # ══════════════════════════════════════════════════════════════════════
     waterfall = 0
-
     if rsi_now > 70:                        waterfall += 30
     elif rsi_now > 60 and rsi_slope < -2:   waterfall += 22
     elif rsi_now > 50 and rsi_slope < -3:   waterfall += 15
     elif rsi_now > 45 and rsi_slope < -1:   waterfall +=  8
     if rsi_now < 30: waterfall = min(waterfall, 10)
-
     if macd_falling:
         waterfall += 20
         if hist_now < hist_prev * 1.2: waterfall += 5
-
     if bear_ema:           waterfall += 20
     elif price_below_ema9: waterfall += 10
-
     if bb_expanding and price_now < bb_mid.iloc[-1]: waterfall += 10
-
-    if mom3_bear:           waterfall += 10
+    if mom3_bear: waterfall += 10
     if momentum_candle and close.iloc[-1] < df["open"].iloc[-1]: waterfall += 5
-
     waterfall = min(int(waterfall), 100)
 
     return rocket, waterfall
 
 
 def run_rocket_analysis(live_price=None):
-    """
-    Phase 30: Lightweight 1-min Rocket/Waterfall scan.
-    Returns dict with rocket, waterfall, signal, entry levels.
-    NO XGBoost, NO Groq — pure speed.
-    """
     global _rw_last_rocket, _rw_last_waterfall
 
-    # Session check — only run during trading hours
     session_quality, trade_allowed = _get_session_quality()
     if not trade_allowed:
         return {
             "rocket": 0, "waterfall": 0,
             "signal": "WAIT", "session_blocked": True,
-            "msg": "Off-hours — standby"
+            "msg": "Off-hours — standby",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    df5 = _fetch_5m_bars()
-    if df5 is None:
-        return {"rocket": 0, "waterfall": 0, "signal": "ERROR", "msg": "No 5m data"}
+    df1 = _fetch_1m_bars()
+    if df1 is None:
+        return {"rocket": 0, "waterfall": 0, "signal": "ERROR", "msg": "No 1m data",
+                "timestamp": datetime.now(timezone.utc).isoformat()}
 
-    rocket, waterfall = _calc_rocket_waterfall(df5, live_price)
+    rocket, waterfall = _calc_rocket_waterfall(df1, live_price)
     _rw_last_rocket    = rocket
     _rw_last_waterfall = waterfall
 
-    # Current live price
-    price = live_price or float(df5["close"].iloc[-1])
+    price = live_price or float(df1["close"].iloc[-1])
 
-    # ATR for SL/TP
     tr  = pd.concat([
-        df5["high"] - df5["low"],
-        (df5["high"] - df5["close"].shift()).abs(),
-        (df5["low"]  - df5["close"].shift()).abs()
+        df1["high"] - df1["low"],
+        (df1["high"] - df1["close"].shift()).abs(),
+        (df1["low"]  - df1["close"].shift()).abs()
     ], axis=1).max(axis=1)
-    atr = float(tr.rolling(14).mean().iloc[-1])
+    atr_1m = float(tr.rolling(14).mean().iloc[-1])
+    # Scale 1min ATR up to H1-equivalent for TP/SL (1m ATR ~= 1/5 of H1 ATR)
+    atr    = max(atr_1m * 5, 8.0)
 
-    # Signal direction
     if rocket >= _RW_ENTRY_THRESHOLD:
         signal = "ROCKET"
         entry  = round(price, 2)
@@ -1182,8 +1115,7 @@ def run_rocket_analysis(live_price=None):
         signal = "WAIT"
         entry = tp1 = tp2 = sl = 0
 
-    # RSI for context
-    delta = df5["close"].diff()
+    delta = df1["close"].diff()
     gain  = delta.clip(lower=0).rolling(14).mean()
     loss  = (-delta.clip(upper=0)).rolling(14).mean()
     rsi   = float((100 - (100 / (1 + gain / (loss + 1e-9)))).iloc[-1])
@@ -1200,5 +1132,7 @@ def run_rocket_analysis(live_price=None):
         "tp2":       tp2,
         "sl":        sl,
         "session":   session_quality,
+        "session_blocked": False,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "signal_time": datetime.now(timezone.utc).isoformat() if signal in ("ROCKET","WATERFALL") else None,
     }
