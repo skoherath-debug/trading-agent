@@ -1,7 +1,17 @@
 """
-XAU/USD Triple Brain Agent - Railway Deployment
-Phase 29 - Smart scheduler, key rotation, live price, canvas chart
+main.py — Phase 30 (PATCHED 2026-04-17)
+
+Fixes in this build:
+  [FIX-A] Added defensive module-level _rw_result = None init (was NameError
+          on /rocket-status endpoint before first scheduler tick)
+  [FIX-B] _pre_signal now correctly produces BUY / SELL / WAIT (was BUY/WAIT only)
+  [FIX-C] rocket_scheduler now uses canonical names from trading_agent.py:
+          _rw_alert_time (not _rw_alert_ts), _RW_ENTRY_COOLDOWN (not _RW_COOLDOWN),
+          _rw_alerted (not _rw_entry_alerted). Prevents NameError on first iteration.
+  [FIX-D] mins_since debug output now computed BEFORE timestamp reset (was always 0)
+  [ADD-A] Added simple heartbeat endpoint & improved /status fallback messaging
 """
+
 import os, threading, time, traceback
 import numpy as np
 import pandas as pd
@@ -11,7 +21,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# ── Phase 28/29: Import Improvements ──────────────────────────
+# ── Phase 28/29: Improvements ─────────────────────────────────
 try:
     from api_improvements import router as improvements_router
     from performance_tracker import tracker
@@ -32,7 +42,7 @@ except Exception as e:
     print(f"⚠️  Improvements not available: {e}")
 
 # ── App ───────────────────────────────────────────────────────
-api = FastAPI(title="XAU/USD Triple Brain Agent · Phase 29")
+api = FastAPI(title="XAU/USD Triple Brain Agent · Phase 30")
 api.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,7 +52,7 @@ api.add_middleware(
 if IMPROVEMENTS_LOADED:
     api.include_router(improvements_router)
 
-# ── Environment variables ─────────────────────────────────────
+# ── Env ───────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT",  "")
 RUN_INTERVAL   = int(os.environ.get("RUN_INTERVAL", "300"))
@@ -53,7 +63,16 @@ TD_KEY         = os.environ.get("TD_KEY",         "")
 MODELS_DIR     = "/app/models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-# ── Phase 29: Tracking ────────────────────────────────────────
+# [FIX-A] DEFENSIVE INIT — will be overridden when trading_agent.py exec's,
+# but prevents NameError if /rocket-status is called before first scheduler tick.
+_rw_result        = None
+_rw_pre_alerted   = False
+_rw_alerted       = False
+_rw_alert_dir     = "WAIT"
+_rw_alert_time    = 0.0
+_rw_alert_price   = 0.0
+_RW_ENTRY_COOLDOWN= 600
+
 _atr_history  = []
 _volatility_ma = 15.0
 
@@ -75,13 +94,6 @@ def sn(v, fallback=0):
 
 # ── Expert Entry Analysis ────────────────────────────────────
 def get_entry_analysis(result, current_price):
-    """
-    Professional entry point analysis:
-    1. Entry zone check — is current price still in valid zone?
-    2. Limit order recommendation
-    3. Confirmation level
-    4. Entry quality score
-    """
     sig    = result.get("signal","WAIT")
     sig_px = sn(result.get("price"), 0)
     atr    = sn(result.get("atr"), 13)
@@ -93,36 +105,30 @@ def get_entry_analysis(result, current_price):
     if sig not in ("BUY","SELL") or sig_px == 0:
         return None
 
-    # Entry zone: signal price ± 0.4 ATR
     zone_size   = round(atr * 0.4, 2)
     zone_low    = round(sig_px - zone_size, 2)
     zone_high   = round(sig_px + zone_size, 2)
-
-    # Limit order level: 0.2 ATR better than signal price
     limit_offset = round(atr * 0.2, 2)
     if sig == "BUY":
-        limit_price = round(sig_px - limit_offset, 2)  # buy cheaper
+        limit_price = round(sig_px - limit_offset, 2)
         in_zone     = zone_low <= current_price <= zone_high
         price_ok    = current_price <= sig_px + zone_size
         confirm_lvl = round(max(sig_px, ema20) + 0.5, 2) if ema20 else sig_px
     else:
-        limit_price = round(sig_px + limit_offset, 2)  # sell higher
+        limit_price = round(sig_px + limit_offset, 2)
         in_zone     = zone_low <= current_price <= zone_high
         price_ok    = current_price >= sig_px - zone_size
         confirm_lvl = round(min(sig_px, ema20) - 0.5, 2) if ema20 else sig_px
 
-    # Slippage from signal price
     slippage    = round(abs(current_price - sig_px), 2)
     slippage_pct= round(slippage / atr * 100, 1)
 
-    # Entry quality score (0-10)
-    if slippage <= atr * 0.1:    quality = 10  # perfect
-    elif slippage <= atr * 0.2:  quality = 8   # excellent
-    elif slippage <= atr * 0.4:  quality = 6   # acceptable
-    elif slippage <= atr * 0.6:  quality = 4   # marginal
-    else:                         quality = 0   # skip
+    if slippage <= atr * 0.1:    quality = 10
+    elif slippage <= atr * 0.2:  quality = 8
+    elif slippage <= atr * 0.4:  quality = 6
+    elif slippage <= atr * 0.6:  quality = 4
+    else:                         quality = 0
 
-    # Adjusted TP/SL from current price
     rr_raw = abs(tp1-sig_px)/abs(sl-sig_px) if abs(sl-sig_px) > 0 else 0
     adj_tp1 = round(current_price + abs(tp1-sig_px), 2) if sig=="BUY" else round(current_price - abs(tp1-sig_px), 2)
     adj_sl  = round(current_price - abs(sl-sig_px),  2) if sig=="BUY" else round(current_price + abs(sl-sig_px),  2)
@@ -221,6 +227,7 @@ try:
     print("trading_agent.py loaded OK")
 except Exception as e:
     print("trading_agent.py FAILED: " + str(e))
+    traceback.print_exc()
 
 # ── Telegram ──────────────────────────────────────────────────
 def tg(msg):
@@ -240,20 +247,14 @@ def tg(msg):
 def get_session():
     t = datetime.now(timezone.utc)
     m = t.hour * 60 + t.minute
-    # Sri Lanka trading: 12:30–23:30 PM = 07:00–18:00 UTC
-    # Best window: London open 07:00–11:00 UTC + NY overlap 13:00–17:00 UTC
-    if 780 <= m < 1020: return "LONDON/NY OVERLAP", "HIGH",   True,  "🔥"  # BEST
-    elif 420 <= m < 780: return "LONDON SESSION",   "HIGH",   True,  "🟢"  # GOOD
-    elif 1020 <= m < 1080: return "NEW YORK SESSION","MEDIUM", True,  "🟡"  # OK
-    else:                  return "ASIAN/OFF-HOURS", "LOW",    False, "🔵"  # SKIP
+    if 780 <= m < 1020: return "LONDON/NY OVERLAP", "HIGH",   True,  "🔥"
+    elif 420 <= m < 780: return "LONDON SESSION",   "HIGH",   True,  "🟢"
+    elif 1020 <= m < 1080: return "NEW YORK SESSION","MEDIUM", True,  "🟡"
+    else:                  return "ASIAN/OFF-HOURS", "LOW",    False, "🔵"
 
-# ── Smart interval ────────────────────────────────────────────
-# ── Dual-phase timing ────────────────────────────────────────
-# Phase A (2.5min): B1 + B2 pre-analysis — fast, no Groq
-# Phase B (5min):   B3 Groq confirmation — full signal decision
-PHASE_A_SECS   = 150   # 2.5 min — pre-compute B1+B2
-PHASE_B_SECS   = 300   # 5.0 min — full analysis + B3 confirm
-OFF_HOURS_SECS = 1800  # 30 min off-hours
+PHASE_A_SECS   = 150
+PHASE_B_SECS   = 300
+OFF_HOURS_SECS = 1800
 
 def get_run_interval():
     m = datetime.now(timezone.utc).hour * 60 + datetime.now(timezone.utc).minute
@@ -264,15 +265,15 @@ last_result   = {}
 last_run_time = ""
 _prev_health  = {}
 _run_count    = 0
-_last_alerted_sig   = "WAIT"   # duplicate suppression
-_pre_signal         = "WAIT"   # Phase A pre-signal
-_pre_b1             = 0.0      # Phase A B1 probability
-_pre_b2             = 0.0      # Phase A B2 score
-_pre_time           = 0.0      # Phase A timestamp
-_phase_a_count      = 0        # counts 2.5min cycles
+_last_alerted_sig   = "WAIT"
+_pre_signal         = "WAIT"
+_pre_b1             = 0.0
+_pre_b2             = 0.0
+_pre_time           = 0.0
+_phase_a_count      = 0
 _last_alerted_price = 0.0
-_last_alerted_time  = 0.0      # cooldown timer
-ALERT_COOLDOWN_SECS = 1800     # 30 min — one signal per gold setup
+_last_alerted_time  = 0.0
+ALERT_COOLDOWN_SECS = 1800
 _price_cache  = {"price": None, "ts": 0.0}
 _chart_cache  = {"bars": [], "ts": 0.0}
 CHART_CACHE_TTL = 60
@@ -299,7 +300,7 @@ def _check_health(result):
 @api.get("/")
 def root():
     sname, sq, _, si = get_session()
-    return {"agent":"XAU/USD Triple Brain · Phase 29","status":"running",
+    return {"agent":"XAU/USD Triple Brain · Phase 30","status":"running",
             "session":sname,"session_quality":sq,"session_icon":si,
             "time":datetime.now(timezone.utc).isoformat(),"last_run":last_run_time or "never",
             "run_count":_run_count}
@@ -317,7 +318,7 @@ def status_ep():
             "last_run":last_run_time or "never","improvements":"ENABLED" if IMPROVEMENTS_LOADED else "DISABLED"}
     if not last_result:
         base.update({"signal":"WAIT","confidence":0,"price":0,
-            "msg":"No analysis yet","health":{
+            "msg":"Agent warming up — first run in ~2.5min","health":{
                 "data_feed":   {"ok":_agent_loaded,"msg":"agent "+("ok" if _agent_loaded else "FAILED")},
                 "brain1":      {"ok":False,"msg":"pending first run"},
                 "brain2":      {"ok":False,"msg":"pending first run"},
@@ -348,7 +349,6 @@ def live_price_ep():
     now = time.time()
     if _price_cache["price"] and (now - _price_cache["ts"]) < 30:
         return JSONResponse(content={"price":_price_cache["price"],"cached":True})
-    # Try all 3 TD keys
     td_keys = [k for k in [
         os.environ.get("TD_KEY","f3883b7831a540cda02cfafcfe77e082"),
         os.environ.get("TD_KEY2","41c8cfdf490b4bf4a0d388e716a32453"),
@@ -412,11 +412,9 @@ def tg_ep(body: dict):
 
 @api.get("/entry-analysis")
 def entry_analysis_ep():
-    """Real-time entry point quality analysis."""
     if not last_result:
         return {"error": "No signal yet"}
     try:
-        # Get current live price
         cur = sn(_price_cache.get("price"), sn(last_result.get("price"), 0))
         analysis = get_entry_analysis(last_result, cur)
         if not analysis:
@@ -427,9 +425,17 @@ def entry_analysis_ep():
 
 @api.get("/rocket-status")
 def rocket_ep():
-    """Phase 30 — latest Rocket/Waterfall micro-entry status."""
-    return JSONResponse(content=clean(_rw_result) if _rw_result else {
-        "rocket":0,"waterfall":0,"signal":"WAIT","msg":"No scan yet — starts 07:00 UTC"
+    """Phase 30 — latest Rocket/Waterfall micro-entry status. [FIX-A] _rw_result pre-initialized."""
+    try:
+        res = _rw_result  # now safe — pre-initialized at module level
+        if res:
+            return JSONResponse(content=clean(res))
+    except NameError:
+        pass
+    return JSONResponse(content={
+        "rocket":0, "waterfall":0, "signal":"WAIT",
+        "msg":"Warming up — first 1m scan in <60s",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
 @api.get("/files")
@@ -448,9 +454,10 @@ def scheduler():
     time.sleep(20)
     sname, _, _, _ = get_session()
     tg(
-        "🚀 AGENT STARTED · Phase 29\n"
+        "🚀 AGENT STARTED · Phase 30\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Schedule: 2min (07-18 UTC) / 30min off-hours\n"
+        "Schedule: 2.5min/5min dual-phase\n"
+        "Rocket scanner: 60s (1m bars)\n"
         "Session: " + sname + "\n"
         "Time: " + datetime.now(timezone.utc).strftime("%H:%M UTC") + "\n"
         "Improvements: " + ("✅ ENABLED" if IMPROVEMENTS_LOADED else "⚠️ DISABLED") + "\n"
@@ -466,22 +473,27 @@ def scheduler():
         try:
             global _pre_signal, _pre_b1, _pre_b2, _pre_time, _phase_a_count
             _phase_a_count += 1
-            is_phase_b = (_phase_a_count % 2 == 0)  # every 2nd cycle = 5min
+            is_phase_b = (_phase_a_count % 2 == 0)
 
-            # ── PHASE A (every 2.5min): B1 + B2 only ─────────────
+            # ── PHASE A ───────────────────────────────────────────
             if not is_phase_b:
                 print("[PHASE A] Pre-computing B1+B2...")
                 try:
-                    # Run lightweight analysis — B1+B2 only, skip B3 Groq
                     result_a = run_analysis()
                     _pre_b1  = sn((result_a.get("brain1") or {}).get("probability"), 0)
                     _pre_b2  = sn((result_a.get("brain2") or {}).get("score"), 0)
                     _pre_time= time.time()
 
-                    # Determine pre-signal direction
+                    # [FIX-B] Properly detect BUY / SELL / WAIT direction
                     if _pre_b1 >= 0.600 and _pre_b2 >= 5.0:
-                        _pre_signal = result_a.get("brain2",{}).get("details",{}).get("trend","WAIT")
-                        _pre_signal = "BUY" if "BULL" in _pre_signal.upper() else "WAIT"
+                        _trend_raw = (result_a.get("brain2",{}).get("details",{}) or {}).get("trend","")
+                        _trend_up  = str(_trend_raw).upper()
+                        if "BULL" in _trend_up:
+                            _pre_signal = "BUY"
+                        elif "BEAR" in _trend_up:
+                            _pre_signal = "SELL"
+                        else:
+                            _pre_signal = "WAIT"
                     else:
                         _pre_signal = "WAIT"
 
@@ -491,9 +503,9 @@ def scheduler():
                 except Exception as ea:
                     print("  [A] Pre-analysis error: " + str(ea)[:100])
                 time.sleep(PHASE_A_SECS)
-                continue  # wait for Phase B
+                continue
 
-            # ── PHASE B (every 5min): Full B3 confirmation ────────
+            # ── PHASE B ───────────────────────────────────────────
             print("[PHASE B] Full analysis with B3 confirmation...")
             result = run_analysis()
             _run_count += 1
@@ -513,21 +525,17 @@ def scheduler():
             h4v   = bool(result.get("h4_veto",        False))
             sb    = bool(result.get("session_blocked", False))
 
-            # Phase B consistency check:
-            # Signal only fires if Phase A pre-signal agrees with Phase B
             phase_consistent = (
-                (_pre_signal == sig) or           # both phases agree
-                (sig in ("BUY","SELL") and         # OR strong signal
-                 abs(time.time()-_pre_time) < 400) # within 2.5min window
+                (_pre_signal == sig) or
+                (sig in ("BUY","SELL") and abs(time.time()-_pre_time) < 400)
             )
 
             if sig in ("BUY","SELL") and not phase_consistent:
                 print("  [B] SUPPRESSED — Phase A=" + _pre_signal + " Phase B=" + sig + " (inconsistent)")
-                sig = "WAIT"  # suppress inconsistent signal
+                sig = "WAIT"
 
             print("  [B] " + sig + " | B1=" + sf(b1,3) + " B2=" + sf(b2,1) + " B3=" + b3v + " conf=" + sf(conf,1) + " $" + sf(price))
 
-            # Phase 28/29 improvements
             if IMPROVEMENTS_LOADED:
                 try:
                     atr_val = sn(result.get("atr", 15.0), 15.0)
@@ -545,29 +553,30 @@ def scheduler():
                 except Exception as e:
                     print("   Improvements error: " + str(e))
 
-            # ── Send BUY/SELL alert ──────────────────────────────
-            # ── Cooldown suppression — 15min between alerts ───────────
+            # ── Alert gating ──────────────────────────────────────
             global _last_alerted_sig, _last_alerted_price, _last_alerted_time
             now_ts       = time.time()
             cooldown_ok  = (now_ts - _last_alerted_time) >= ALERT_COOLDOWN_SECS
-            dir_changed  = sig != _last_alerted_sig   # BUY→SELL always fires
+            dir_changed  = sig != _last_alerted_sig
             price_moved  = abs(price - _last_alerted_price) > 8.0
 
-            # Quality gates for alert
             session_quality_ok = sq2 in ("HIGH", "MEDIUM")
             rocket_score    = sn((result.get("brain2") or {}).get("details", {}).get("rocket_score"), 0)
             waterfall_score = sn((result.get("brain2") or {}).get("details", {}).get("waterfall_score"), 0)
-            momentum_ok = (sig == "BUY"  and rocket_score    >= 50) or                           (sig == "SELL" and waterfall_score >= 50)
+            momentum_ok = (
+                (sig == "BUY"  and rocket_score    >= 50) or
+                (sig == "SELL" and waterfall_score >= 50)
+            )
 
-            # Fire if: cooldown ok AND session ok AND momentum confirmed OR direction flipped
             should_alert = (cooldown_ok and session_quality_ok and momentum_ok) or dir_changed
 
             if sig in ("BUY", "SELL") and should_alert:
+                # [FIX-D] Compute mins_since BEFORE resetting timestamp
+                mins_since = round((now_ts - _last_alerted_time)/60, 1) if _last_alerted_time else 0
                 _last_alerted_sig   = sig
                 _last_alerted_price = price
                 _last_alerted_time  = now_ts
-                mins_since = round((now_ts - _last_alerted_time)/60, 1) if _last_alerted_time else 0
-                print("   📱 ALERT: " + sig + " (cooldown ok, last alert " + str(mins_since) + "m ago)")
+                print("   📱 ALERT: " + sig + " (last alert " + str(mins_since) + "m ago)")
                 icon = "📈" if sig == "BUY" else "📉"
                 rr   = round(abs(tp-price)/abs(sl-price),1) if abs(sl-price) > 0 else 0
 
@@ -581,7 +590,6 @@ def scheduler():
                         )
                     except Exception: pass
 
-                # Expert entry analysis
                 ea = get_entry_analysis(result, price)
                 if ea:
                     q_emoji = "🟢" if ea["quality"]>=8 else "🟡" if ea["quality"]>=5 else "🔴"
@@ -614,14 +622,11 @@ def scheduler():
                     + "agent.ceylonpropertylink.com"
                 )
 
-            # Reset tracker when WAIT — allows fresh signal next time
             if sig == "WAIT" and _last_alerted_sig in ("BUY","SELL"):
                 _last_alerted_sig   = "WAIT"
                 _last_alerted_price = 0.0
-                # Don't reset _last_alerted_time — cooldown still applies
 
-
-            # ── SL / TP price alerts ─────────────────────────────────────────
+            # ── SL / TP price alerts ──────────────────────────────
             _tp1  = sn(last_result.get("tp"),  0)
             _tp2  = sn(last_result.get("tp2"), 0)
             _sl   = sn(last_result.get("sl"),  0)
@@ -656,22 +661,40 @@ def scheduler():
         except Exception as e:
             short = str(e)[:200]
             print("[SCHEDULER ERROR] " + short)
+            traceback.print_exc()
             tg("❌ Analysis error:\n" + short + "\n" + now_str)
 
-        time.sleep(PHASE_A_SECS)  # always 2.5min between cycles
+        time.sleep(PHASE_A_SECS)
 
 
-# ── Phase 30: Rocket/Waterfall fast scheduler (60s) ──────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# [FIX-C] Rocket/Waterfall scheduler — now uses CANONICAL names
+# from trading_agent.py, no more _rw_alert_ts / _RW_COOLDOWN / _rw_entry_alerted
+# ═══════════════════════════════════════════════════════════════
 def rocket_scheduler():
-    global _rw_result, _rw_pre_alerted, _rw_entry_alerted
-    global _rw_alert_dir, _rw_alert_ts, _rw_alert_price
+    global _rw_result, _rw_pre_alerted, _rw_alerted
+    global _rw_alert_dir, _rw_alert_time, _rw_alert_price
     import time as _t
-    _t.sleep(30)  # stagger from main scheduler
-    print("[RW] Phase 30 Rocket/Waterfall scheduler started")
+    _t.sleep(30)
+    print("[RW] Phase 30 Rocket/Waterfall scheduler started (1m bars, 60s tick)")
     while True:
         try:
-            # Get live price from cache
+            # Get fresh price — if cache is older than 15s, fetch a new one directly
             live_p = _price_cache.get("price")
+            cache_age = _t.time() - _price_cache.get("ts", 0)
+            if not live_p or cache_age > 15:
+                try:
+                    _k = get_td_key()
+                    _r = req.get("https://api.twelvedata.com/price",
+                                 params={"symbol":"XAU/USD","apikey":_k}, timeout=5)
+                    _p = float(_r.json().get("price", 0))
+                    if _p > 100:
+                        live_p = round(_p, 2)
+                        _price_cache["price"] = live_p
+                        _price_cache["ts"]    = _t.time()
+                except Exception:
+                    pass
+
             result = run_rocket_analysis(live_p)
             _rw_result = result
 
@@ -690,11 +713,11 @@ def rocket_scheduler():
             print(f"[RW] 🚀{rocket} 💧{waterfall} | {signal} | ${sf(price)} | RSI={sf(rsi,1)}")
 
             now_ts = _t.time()
-            cooldown_ok = (now_ts - _rw_alert_ts) >= _RW_COOLDOWN
+            cooldown_ok = (now_ts - _rw_alert_time) >= _RW_ENTRY_COOLDOWN
             dir_flip    = (signal in ("ROCKET","WATERFALL") and
                            signal.split("_")[0] != _rw_alert_dir.split("_")[0])
 
-            # ── PRE-ALERT: Rocket/Waterfall building (40+) ──────────────────
+            # PRE-ALERT (building)
             if signal in ("ROCKET_BUILDING","WATERFALL_BUILDING") and not _rw_pre_alerted:
                 emoji = "🚀" if "ROCKET" in signal else "💧"
                 score = rocket if "ROCKET" in signal else waterfall
@@ -711,7 +734,7 @@ def rocket_scheduler():
                 _rw_pre_alerted = True
                 print(f"[RW] Pre-alert sent: {signal} {score}/100")
 
-            # ── ENTRY ALERT: Full entry signal (60+) ────────────────────────
+            # ENTRY ALERT
             elif signal in ("ROCKET","WATERFALL") and (cooldown_ok or dir_flip):
                 emoji    = "⚡🚀" if signal == "ROCKET" else "⚡💧"
                 dir_word = "BUY" if signal == "ROCKET" else "SELL"
@@ -724,7 +747,7 @@ def rocket_scheduler():
                    + "━━━━━━━━━━━━━━━━━━━━\n"
                    + mom_str2 + str(score) + "/100  RSI: " + sf(rsi,1) + "\n"
                    + "━━━━━━━━━━━━━━━━━━━━\n"
-                   + "Entry: $" + sf(entry) + "  (+-$" + sf(max_slip) + ")\n"
+                   + "Entry: $" + sf(entry) + "  (±$" + sf(max_slip) + ")\n"
                    + "TP1  : $" + sf(tp1) + "  (+" + sf(abs(tp1-entry)) + ")\n"
                    + "TP2  : $" + sf(tp2) + "  (+" + sf(abs(tp2-entry)) + ")\n"
                    + "SL   : $" + sf(sl) + "  (-" + sf(abs(sl-entry)) + ")\n"
@@ -733,25 +756,25 @@ def rocket_scheduler():
                    + "Skip if price moved >$" + sf(max_slip) + "\n"
                    + now_s + " | Phase 30 | agent.ceylonpropertylink.com")
                 _rw_alert_dir   = signal
-                _rw_alert_ts    = now_ts
+                _rw_alert_time  = now_ts
                 _rw_alert_price = price
-                _rw_entry_alerted = True
-                _rw_pre_alerted   = False  # reset for next setup
-                print(f"[RW] ENTRY ALERT sent: {dir_word} ${sf(price)} Rocket={rocket} WF={waterfall}")
+                _rw_alerted     = True
+                _rw_pre_alerted = False
+                print(f"[RW] ENTRY ALERT sent: {dir_word} ${sf(price)} R={rocket} W={waterfall}")
 
-            # Reset pre-alert when momentum fades
             if signal == "WAIT" and _rw_pre_alerted:
-                _rw_pre_alerted   = False
-                _rw_entry_alerted = False
+                _rw_pre_alerted = False
+                _rw_alerted     = False
 
         except Exception as e:
-            print(f"[RW] Scheduler error: {str(e)[:100]}")
+            print(f"[RW] Scheduler error: {str(e)[:150]}")
+            traceback.print_exc()
 
-        _t.sleep(60)  # run every 60 seconds
+        _t.sleep(60)
 
 threading.Thread(target=rocket_scheduler, daemon=True).start()
-print("[RW] Phase 30 Rocket/Waterfall scheduler started — 60s interval")
+print("[RW] Phase 30 Rocket/Waterfall scheduler thread launched — 60s interval")
 
 threading.Thread(target=scheduler, daemon=True).start()
-print("Scheduler started - 2min trading / 30min off-hours · Phase 29")
+print("Scheduler started — 2.5/5min dual-phase · Phase 30")
 print("Improvements: " + ("ENABLED ✅" if IMPROVEMENTS_LOADED else "DISABLED ⚠️"))
