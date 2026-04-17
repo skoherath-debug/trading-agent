@@ -924,3 +924,281 @@ def run_analysis():
         "rocket_score":     rocket,
         "waterfall_score":  waterfall,
     })
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 30 — ROCKET/WATERFALL MICRO-ENTRY SYSTEM
+# Runs every 60s. Catches momentum at candle 1, not candle 3.
+# Uses 5m chart (faster signals) + live price via Finnhub WebSocket
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Phase 30 state ────────────────────────────────────────────────────────────
+_rw_last_rocket    = 0
+_rw_last_waterfall = 0
+_rw_pre_alerted    = False   # fired pre-alert (40+)
+_rw_alerted        = False   # fired entry alert (60+)
+_rw_alert_dir      = "WAIT"  # last alerted direction
+_rw_alert_time     = 0.0     # last alert timestamp
+_rw_alert_price    = 0.0     # price when alert fired
+_rw_5m_cache       = None    # cached 5m bars
+_rw_5m_cache_ts    = 0.0     # cache timestamp
+_RW_CACHE_TTL      = 60      # refresh 5m bars every 60s
+_RW_ENTRY_COOLDOWN = 600     # 10min between entry alerts same direction
+_RW_PRE_THRESHOLD  = 40      # pre-alert threshold
+_RW_ENTRY_THRESHOLD= 60      # entry alert threshold
+
+def _fetch_5m_bars():
+    """Fetch 5-minute bars — the fastest reliable Twelve Data interval."""
+    global _rw_5m_cache, _rw_5m_cache_ts
+    import time as _time_mod
+    now = _time_mod.time()
+    if _rw_5m_cache is not None and (now - _rw_5m_cache_ts) < _RW_CACHE_TTL:
+        return _rw_5m_cache
+    all_keys = [k for k in [
+        os.environ.get("TD_KEY",  "f3883b7831a540cda02cfafcfe77e082"),
+        os.environ.get("TD_KEY2", "41c8cfdf490b4bf4a0d388e716a32453"),
+        os.environ.get("TD_KEY3", "f58b0a482f1443e78fb23cf8975b44d9"),
+    ] if k]
+    for key in all_keys:
+        try:
+            r = requests.get("https://api.twelvedata.com/time_series", params={
+                "symbol": "XAU/USD", "interval": "5min", "outputsize": 100,
+                "apikey": key, "timezone": "UTC", "format": "JSON"
+            }, timeout=15)
+            d = r.json()
+            if "values" not in d:
+                continue
+            rows = []
+            for v in reversed(d["values"]):
+                try:
+                    rows.append({
+                        "open":  float(v["open"]),
+                        "high":  float(v["high"]),
+                        "low":   float(v["low"]),
+                        "close": float(v["close"]),
+                        "datetime": v["datetime"],
+                    })
+                except Exception:
+                    pass
+            if len(rows) < 20:
+                continue
+            df = pd.DataFrame(rows)
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.set_index("datetime").sort_index()
+            _rw_5m_cache    = df
+            _rw_5m_cache_ts = now
+            print(f"[RW] 5m bars loaded: {len(df)} via key {all_keys.index(key)+1}")
+            return df
+        except Exception as e:
+            print(f"[RW] 5m fetch key error: {e}")
+    return None
+
+def _calc_rocket_waterfall(df, live_price=None):
+    """
+    World-class Rocket/Waterfall scorer for XAU/USD.
+    Uses 5m bars for speed + live price to update last candle.
+    Returns rocket (0-100) and waterfall (0-100).
+    """
+    if df is None or len(df) < 20:
+        return 0, 0
+
+    close = df["close"].copy()
+    high  = df["high"].copy()
+    low   = df["low"].copy()
+
+    # Inject live price into last candle if available
+    if live_price and live_price > 100:
+        close.iloc[-1] = live_price
+        high.iloc[-1]  = max(high.iloc[-1], live_price)
+        low.iloc[-1]   = min(low.iloc[-1],  live_price)
+
+    # ── RSI(14) ──────────────────────────────────────────────────────────────
+    delta = close.diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi   = (100 - (100 / (1 + gain / (loss + 1e-9))))
+    rsi_now   = rsi.iloc[-1]
+    rsi_prev  = rsi.iloc[-3]
+    rsi_slope = rsi_now - rsi_prev   # slope over last 3 candles
+
+    # ── MACD(12,26,9) ────────────────────────────────────────────────────────
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd  = ema12 - ema26
+    sig9  = macd.ewm(span=9, adjust=False).mean()
+    hist  = macd - sig9
+    hist_now  = hist.iloc[-1]
+    hist_prev = hist.iloc[-3]
+    macd_rising  = hist_now > hist_prev and hist_now > 0
+    macd_falling = hist_now < hist_prev and hist_now < 0
+
+    # ── EMA alignment (9/21/50) ───────────────────────────────────────────
+    ema9  = close.ewm(span=9,  adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    price_now = close.iloc[-1]
+    bull_ema = (price_now > ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1])
+    bear_ema = (price_now < ema9.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1])
+    price_above_ema9  = price_now > ema9.iloc[-1]
+    price_below_ema9  = price_now < ema9.iloc[-1]
+
+    # ── ATR(14) for volatility confirmation ──────────────────────────────
+    tr   = pd.concat([high - low,
+                      (high - close.shift()).abs(),
+                      (low  - close.shift()).abs()], axis=1).max(axis=1)
+    atr  = tr.rolling(14).mean().iloc[-1]
+    # Momentum candle: last candle body > 0.3 ATR
+    body = abs(close.iloc[-1] - df["open"].iloc[-1])
+    momentum_candle = body > atr * 0.3
+
+    # ── Bollinger Bands squeeze → breakout ───────────────────────────────
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    bb_up  = bb_mid + 2 * bb_std
+    bb_dn  = bb_mid - 2 * bb_std
+    bb_width_now  = (bb_up.iloc[-1]  - bb_dn.iloc[-1])
+    bb_width_prev = (bb_up.iloc[-5]  - bb_dn.iloc[-5])
+    bb_expanding = bb_width_now > bb_width_prev * 1.05
+
+    # ── Price momentum (last 3 candles) ───────────────────────────────────
+    mom3 = close.iloc[-1] - close.iloc[-4]   # 3-candle price change
+    mom3_bull = mom3 > atr * 0.2
+    mom3_bear = mom3 < -atr * 0.2
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ROCKET SCORE (bullish momentum, 0-100)
+    # ══════════════════════════════════════════════════════════════════════
+    rocket = 0
+
+    # RSI: best BUY when bouncing from oversold
+    if rsi_now < 30:                      rocket += 30   # deep oversold = max setup
+    elif rsi_now < 40 and rsi_slope > 2:  rocket += 22   # oversold + rising
+    elif rsi_now < 50 and rsi_slope > 3:  rocket += 15   # recovering
+    elif rsi_now < 55 and rsi_slope > 1:  rocket +=  8   # mild bullish
+    # Cap at overbought
+    if rsi_now > 70: rocket = min(rocket, 10)
+
+    # MACD histogram rising + above zero
+    if macd_rising:
+        rocket += 20
+        if hist_now > abs(hist_prev) * 1.2: rocket += 5   # accelerating
+
+    # EMA alignment
+    if bull_ema:          rocket += 20
+    elif price_above_ema9: rocket += 10
+
+    # Bollinger expansion (breakout)
+    if bb_expanding and price_now > bb_mid.iloc[-1]: rocket += 10
+
+    # Price momentum
+    if mom3_bull:          rocket += 10
+    if momentum_candle and close.iloc[-1] > df["open"].iloc[-1]: rocket += 5
+
+    rocket = min(int(rocket), 100)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # WATERFALL SCORE (bearish momentum, 0-100)
+    # ══════════════════════════════════════════════════════════════════════
+    waterfall = 0
+
+    if rsi_now > 70:                        waterfall += 30
+    elif rsi_now > 60 and rsi_slope < -2:   waterfall += 22
+    elif rsi_now > 50 and rsi_slope < -3:   waterfall += 15
+    elif rsi_now > 45 and rsi_slope < -1:   waterfall +=  8
+    if rsi_now < 30: waterfall = min(waterfall, 10)
+
+    if macd_falling:
+        waterfall += 20
+        if hist_now < hist_prev * 1.2: waterfall += 5
+
+    if bear_ema:           waterfall += 20
+    elif price_below_ema9: waterfall += 10
+
+    if bb_expanding and price_now < bb_mid.iloc[-1]: waterfall += 10
+
+    if mom3_bear:           waterfall += 10
+    if momentum_candle and close.iloc[-1] < df["open"].iloc[-1]: waterfall += 5
+
+    waterfall = min(int(waterfall), 100)
+
+    return rocket, waterfall
+
+
+def run_rocket_analysis(live_price=None):
+    """
+    Phase 30: Lightweight 1-min Rocket/Waterfall scan.
+    Returns dict with rocket, waterfall, signal, entry levels.
+    NO XGBoost, NO Groq — pure speed.
+    """
+    global _rw_last_rocket, _rw_last_waterfall
+
+    # Session check — only run during trading hours
+    session_quality, trade_allowed = _get_session_quality()
+    if not trade_allowed:
+        return {
+            "rocket": 0, "waterfall": 0,
+            "signal": "WAIT", "session_blocked": True,
+            "msg": "Off-hours — standby"
+        }
+
+    df5 = _fetch_5m_bars()
+    if df5 is None:
+        return {"rocket": 0, "waterfall": 0, "signal": "ERROR", "msg": "No 5m data"}
+
+    rocket, waterfall = _calc_rocket_waterfall(df5, live_price)
+    _rw_last_rocket    = rocket
+    _rw_last_waterfall = waterfall
+
+    # Current live price
+    price = live_price or float(df5["close"].iloc[-1])
+
+    # ATR for SL/TP
+    tr  = pd.concat([
+        df5["high"] - df5["low"],
+        (df5["high"] - df5["close"].shift()).abs(),
+        (df5["low"]  - df5["close"].shift()).abs()
+    ], axis=1).max(axis=1)
+    atr = float(tr.rolling(14).mean().iloc[-1])
+
+    # Signal direction
+    if rocket >= _RW_ENTRY_THRESHOLD:
+        signal = "ROCKET"
+        entry  = round(price, 2)
+        tp1    = round(price + atr * 1.2, 2)
+        tp2    = round(price + atr * 2.0, 2)
+        sl     = round(price - atr * 0.8, 2)
+    elif waterfall >= _RW_ENTRY_THRESHOLD:
+        signal = "WATERFALL"
+        entry  = round(price, 2)
+        tp1    = round(price - atr * 1.2, 2)
+        tp2    = round(price - atr * 2.0, 2)
+        sl     = round(price + atr * 0.8, 2)
+    elif rocket >= _RW_PRE_THRESHOLD:
+        signal = "ROCKET_BUILDING"
+        entry = tp1 = tp2 = sl = 0
+    elif waterfall >= _RW_PRE_THRESHOLD:
+        signal = "WATERFALL_BUILDING"
+        entry = tp1 = tp2 = sl = 0
+    else:
+        signal = "WAIT"
+        entry = tp1 = tp2 = sl = 0
+
+    # RSI for context
+    delta = df5["close"].diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi   = float((100 - (100 / (1 + gain / (loss + 1e-9)))).iloc[-1])
+
+    return {
+        "rocket":    rocket,
+        "waterfall": waterfall,
+        "signal":    signal,
+        "price":     round(price, 2),
+        "rsi":       round(rsi, 1),
+        "atr":       round(atr, 2),
+        "entry":     entry,
+        "tp1":       tp1,
+        "tp2":       tp2,
+        "sl":        sl,
+        "session":   session_quality,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
