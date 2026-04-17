@@ -60,6 +60,8 @@ PKL_ID         = os.environ.get("MODEL_PKL_ID",  "")
 JSON_ID        = os.environ.get("MODEL_JSON_ID", "")
 TPSL_ID        = os.environ.get("TPSL_JSON_ID",  "")
 TD_KEY         = os.environ.get("TD_KEY",         "")
+BRAIN4_PKL_ID  = os.environ.get("BRAIN4_PKL_ID",  "")   # Google Drive file ID
+BRAIN4_JSON_ID = os.environ.get("BRAIN4_JSON_ID", "")   # Google Drive file ID
 MODELS_DIR     = "/app/models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -216,6 +218,10 @@ def download_file(file_id, dest):
 download_file(PKL_ID,  MODELS_DIR + "/brain1_xgboost_v4.pkl")
 download_file(JSON_ID, MODELS_DIR + "/brain1_features_v4.json")
 download_file(TPSL_ID, MODELS_DIR + "/dynamic_tpsl_config.json")
+
+# [PHASE 31] Brain 4 — Rocket predictor (optional; slope works without it)
+download_file(BRAIN4_PKL_ID,  MODELS_DIR + "/brain4_rocket_pred.pkl")
+download_file(BRAIN4_JSON_ID, MODELS_DIR + "/brain4_features.json")
 
 # ── Load trading_agent.py ─────────────────────────────────────
 _agent_loaded = False
@@ -450,8 +456,8 @@ def files_ep():
 
 # ── Scheduler ─────────────────────────────────────────────────
 def scheduler():
-    global _run_count, _volatility_ma
-    time.sleep(20)
+    global _run_count, _volatility_ma, _phase_a_count
+    time.sleep(10)  # was 20 — reduced startup delay
     sname, _, _, _ = get_session()
     tg(
         "🚀 AGENT STARTED · Phase 30\n"
@@ -465,13 +471,18 @@ def scheduler():
         "agent.ceylonpropertylink.com"
     )
 
+    # [WARMUP] Immediate Phase B on startup — no 2.5min wait after redeploy
+    # Force _phase_a_count to 1 so first iteration is Phase B (full analysis + B3)
+    _phase_a_count = 1
+    print("[STARTUP] Running IMMEDIATE full analysis (no warmup wait)...")
+
     while True:
         now_str          = datetime.now(timezone.utc).strftime("%H:%M UTC")
         sname2, sq2, stok2, _ = get_session()
         print("[" + now_str + "] Running | " + sq2)
 
         try:
-            global _pre_signal, _pre_b1, _pre_b2, _pre_time, _phase_a_count
+            global _pre_signal, _pre_b1, _pre_b2, _pre_time
             _phase_a_count += 1
             is_phase_b = (_phase_a_count % 2 == 0)
 
@@ -674,12 +685,19 @@ def scheduler():
 def rocket_scheduler():
     global _rw_result, _rw_pre_alerted, _rw_alerted
     global _rw_alert_dir, _rw_alert_time, _rw_alert_price
+    # PHASE 31: prediction alert state
+    _rw_imminent_last_dir = "NONE"
+    _rw_imminent_last_ts  = 0.0
+    _rw_b4_last_dir       = "NONE"
+    _rw_b4_last_ts        = 0.0
+    IMMINENT_COOLDOWN     = 300  # 5 min between imminent alerts same direction
+    B4_COOLDOWN           = 300  # 5 min between Brain 4 predicted alerts
+
     import time as _t
-    _t.sleep(30)
-    print("[RW] Phase 30 Rocket/Waterfall scheduler started (1m bars, 60s tick)")
+    _t.sleep(5)
+    print("[RW] Phase 30+31 Rocket scheduler started (1m bars, slope predictor, Brain 4)")
     while True:
         try:
-            # Get fresh price — if cache is older than 15s, fetch a new one directly
             live_p = _price_cache.get("price")
             cache_age = _t.time() - _price_cache.get("ts", 0)
             if not live_p or cache_age > 15:
@@ -708,17 +726,86 @@ def rocket_scheduler():
             tp1       = result.get("tp1", 0)
             tp2       = result.get("tp2", 0)
             sl        = result.get("sl", 0)
+            # PHASE 31 fields
+            r_slope   = result.get("rocket_slope", 0)
+            w_slope   = result.get("waterfall_slope", 0)
+            r_eta     = result.get("rocket_eta_sec")
+            w_eta     = result.get("waterfall_eta_sec")
+            b4_r      = result.get("b4_rocket_prob", 0.0)
+            b4_w      = result.get("b4_waterfall_prob", 0.0)
+            b4_sig    = result.get("b4_signal")
+            b4_loaded = result.get("b4_loaded", False)
             now_s     = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-            print(f"[RW] 🚀{rocket} 💧{waterfall} | {signal} | ${sf(price)} | RSI={sf(rsi,1)}")
+            b4_tag = ""
+            if b4_loaded:
+                b4_tag = f" | B4={b4_r:.2f}"
+            print(f"[RW] 🚀{rocket} 💧{waterfall} | {signal} | ${sf(price)} | RSI={sf(rsi,1)} "
+                  f"| slope R{r_slope:+.1f}/W{w_slope:+.1f}{b4_tag}")
 
             now_ts = _t.time()
             cooldown_ok = (now_ts - _rw_alert_time) >= _RW_ENTRY_COOLDOWN
             dir_flip    = (signal in ("ROCKET","WATERFALL") and
                            signal.split("_")[0] != _rw_alert_dir.split("_")[0])
 
-            # PRE-ALERT (building)
-            if signal in ("ROCKET_BUILDING","WATERFALL_BUILDING") and not _rw_pre_alerted:
+            # ── [PHASE 31] BRAIN 4 PREDICTION ALERT (highest priority early warning) ──
+            if signal in ("ROCKET_PREDICTED", "WATERFALL_PREDICTED"):
+                b4_dir = "ROCKET" if "ROCKET" in signal else "WATERFALL"
+                b4_cooldown_ok = (now_ts - _rw_b4_last_ts) >= B4_COOLDOWN
+                b4_dir_change  = b4_dir != _rw_b4_last_dir
+
+                if b4_cooldown_ok or b4_dir_change:
+                    emoji   = "🔮🚀" if b4_dir == "ROCKET" else "🔮💧"
+                    dir_wrd = "BUY"  if b4_dir == "ROCKET" else "SELL"
+                    prob    = b4_r if b4_dir == "ROCKET" else b4_w
+
+                    tg(emoji + " BRAIN 4 PREDICTION — XAU/USD\n"
+                       + "━━━━━━━━━━━━━━━━━━━━\n"
+                       + "ML says " + dir_wrd + " momentum likely\n"
+                       + "within next 3 minutes\n"
+                       + "━━━━━━━━━━━━━━━━━━━━\n"
+                       + "Confidence: " + f"{prob*100:.0f}%\n"
+                       + "Current score: R=" + str(rocket) + " W=" + str(waterfall) + "\n"
+                       + "Price: $" + sf(price) + "  RSI: " + sf(rsi,1) + "\n"
+                       + "━━━━━━━━━━━━━━━━━━━━\n"
+                       + "Prepare entry — wait for full signal\n"
+                       + now_s + " | Phase 31 B4\n"
+                       + "agent.ceylonpropertylink.com")
+                    _rw_b4_last_dir = b4_dir
+                    _rw_b4_last_ts  = now_ts
+                    print(f"[RW] B4 PREDICTION sent: {dir_wrd} prob={prob:.2f}")
+
+            # ── [PHASE 31] SLOPE-BASED IMMINENT ALERT (fast, no ML needed) ──
+            elif signal in ("ROCKET_IMMINENT", "WATERFALL_IMMINENT"):
+                imm_dir = "ROCKET" if "ROCKET" in signal else "WATERFALL"
+                imm_cooldown_ok = (now_ts - _rw_imminent_last_ts) >= IMMINENT_COOLDOWN
+                imm_dir_change  = imm_dir != _rw_imminent_last_dir
+
+                if imm_cooldown_ok or imm_dir_change:
+                    emoji   = "⚠️🚀" if imm_dir == "ROCKET" else "⚠️💧"
+                    dir_wrd = "BUY"  if imm_dir == "ROCKET" else "SELL"
+                    score   = rocket if imm_dir == "ROCKET" else waterfall
+                    slope   = r_slope if imm_dir == "ROCKET" else w_slope
+                    eta     = r_eta if imm_dir == "ROCKET" else w_eta
+                    eta_str = f"~{int(eta)}s" if eta else "soon"
+
+                    tg(emoji + " " + imm_dir + " IMMINENT — XAU/USD\n"
+                       + "━━━━━━━━━━━━━━━━━━━━\n"
+                       + "Score: " + str(score) + "/100 (rising)\n"
+                       + "Slope: +" + sf(slope,1) + "/min\n"
+                       + "ETA to ignition: " + eta_str + "\n"
+                       + "━━━━━━━━━━━━━━━━━━━━\n"
+                       + "Price: $" + sf(price) + "  RSI: " + sf(rsi,1) + "\n"
+                       + "Pre-position: " + dir_wrd + "\n"
+                       + "Wait for ENTRY ALERT to fire\n"
+                       + now_s + " | Phase 31 Slope\n"
+                       + "agent.ceylonpropertylink.com")
+                    _rw_imminent_last_dir = imm_dir
+                    _rw_imminent_last_ts  = now_ts
+                    print(f"[RW] IMMINENT sent: {dir_wrd} score={score} slope={slope:+.1f}/min eta={eta_str}")
+
+            # PRE-ALERT (building) — only if no imminent/predicted already fired
+            elif signal in ("ROCKET_BUILDING","WATERFALL_BUILDING") and not _rw_pre_alerted:
                 emoji = "🚀" if "ROCKET" in signal else "💧"
                 score = rocket if "ROCKET" in signal else waterfall
                 mom_str = "🚀 Rocket: " if "ROCKET" in signal else "💧 Waterfall: "
@@ -734,7 +821,7 @@ def rocket_scheduler():
                 _rw_pre_alerted = True
                 print(f"[RW] Pre-alert sent: {signal} {score}/100")
 
-            # ENTRY ALERT
+            # ENTRY ALERT (actual ignition)
             elif signal in ("ROCKET","WATERFALL") and (cooldown_ok or dir_flip):
                 emoji    = "⚡🚀" if signal == "ROCKET" else "⚡💧"
                 dir_word = "BUY" if signal == "ROCKET" else "SELL"
