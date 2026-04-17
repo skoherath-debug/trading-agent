@@ -456,22 +456,38 @@ def rocket_ep():
 # ═══════════════════════════════════════════════════════════════════
 # TRADE COACH ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════
+# Micro-cache for coach-status — dashboard polls at 250ms, cache at 200ms
+# means at most 5 disk reads per second per user instead of 4 per user.
+_coach_cache = {"data": None, "ts": 0.0}
+_COACH_CACHE_TTL = 0.2  # 200ms
+
 @api.get("/coach-status")
 def coach_status_ep():
-    """Return the current state of the trade coach — for dashboard display."""
+    """Return the current state of the trade coach — for dashboard display.
+    Micro-cached 200ms to survive high-frequency polling."""
     if not COACH_LOADED:
         return {"loaded": False, "state": "UNAVAILABLE"}
+
+    now = time.time()
+    # Serve from cache if still fresh (dashboard polls 4x/sec, cache holds 200ms)
+    if _coach_cache["data"] and (now - _coach_cache["ts"]) < _COACH_CACHE_TTL:
+        return JSONResponse(content=_coach_cache["data"])
+
     try:
         s = trade_coach.load_state()
         # Add human-readable fields for dashboard
         if s.get("trade_open_ts"):
-            s["trade_age_min"] = int((time.time() - s["trade_open_ts"]) / 60)
+            s["trade_age_min"] = int((now - s["trade_open_ts"]) / 60)
         if s.get("last_closed_ts"):
             s["cooldown_remaining_sec"] = max(0, int(
-                trade_coach.MIN_TIME_BETWEEN_SEC - (time.time() - s["last_closed_ts"])
+                trade_coach.MIN_TIME_BETWEEN_SEC - (now - s["last_closed_ts"])
             ))
         s["loaded"] = True
-        return JSONResponse(content=clean(s))
+        cleaned = clean(s)
+        # Cache the cleaned result
+        _coach_cache["data"] = cleaned
+        _coach_cache["ts"]   = now
+        return JSONResponse(content=cleaned)
     except Exception as e:
         return JSONResponse(content={"loaded": True, "state": "ERROR", "error": str(e)})
 
@@ -508,9 +524,11 @@ async def telegram_webhook_ep(payload: dict):
         state = trade_coach.load_state()
         if data == "trade_yes":
             state = trade_coach.on_user_confirmed_yes(state, TELEGRAM_TOKEN, TELEGRAM_CHAT)
+            _coach_cache["ts"] = 0.0   # invalidate cache → dashboard gets fresh data next poll
             return {"ok": True, "action": "trade_started"}
         elif data == "trade_no":
             state = trade_coach.on_user_confirmed_no(state, TELEGRAM_TOKEN, TELEGRAM_CHAT)
+            _coach_cache["ts"] = 0.0   # invalidate cache
             return {"ok": True, "action": "trade_skipped"}
         return {"ok": True, "msg": f"unknown callback: {data}"}
     except Exception as e:
@@ -524,6 +542,7 @@ def coach_reset_ep():
     if not COACH_LOADED:
         return {"ok": False}
     state = trade_coach.reset_state_to_scanning()
+    _coach_cache["ts"] = 0.0   # invalidate cache
     return {"ok": True, "state": state["state"]}
 
 @api.get("/files")
@@ -796,7 +815,7 @@ def rocket_scheduler():
             print(f"[RW] Scheduler error: {str(e)[:150]}")
             traceback.print_exc()
 
-        _t.sleep(60)
+        _t.sleep(30)   # was 60s — faster trade monitoring while position open
 
 threading.Thread(target=rocket_scheduler, daemon=True).start()
 print("[RW] Phase 30 Rocket/Waterfall scheduler thread launched — 60s interval")
