@@ -1,15 +1,16 @@
 """
-main_phase31.py — Phase 31 Week 1 Entry Point
+main_phase31.py — Phase 31 Week 1+
+Real-time XAU/USD feed via Finnhub WebSocket.
 
-What it does:
-  1. Starts Finnhub WebSocket feed (background thread)
-  2. Bootstraps historical candles from Twelve Data
-  3. Logs candle closes (Brains wiring happens Week 2)
-  4. Health monitor logs every 30s
-  5. Exposes a tiny HTTP /health + /snapshot endpoint on $PORT
-     (so Railway knows the service is alive)
+Endpoints (all JSON, CORS enabled):
+  /              — basic health
+  /health        — detailed health (feed + mode + age)
+  /snapshot      — full state dump (price, candles, history)
+  /live-price    — dashboard-compatible live price
+  /status        — dashboard-compatible status (for "Connecting..." badge)
+  /chart-data    — M5 OHLC candles for the dashboard chart
 
-SAFETY: MODE env var must be PAPER. Will refuse to start otherwise.
+SAFETY: MODE env var must be PAPER to start.
 """
 
 import os
@@ -19,13 +20,11 @@ import json
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
 
 from data_feed_finnhub import FinnhubRealTimeFeed
 from bootstrap_history  import bootstrap_all
 
-# ──────────────────────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────────────────────
 logging.basicConfig(
     level  = logging.INFO,
     format = "%(asctime)s [%(levelname)s] %(message)s",
@@ -33,22 +32,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("phase31")
 
-# ──────────────────────────────────────────────────────────────
-# Safety check
-# ──────────────────────────────────────────────────────────────
 MODE = os.getenv("MODE", "").upper()
 if MODE != "PAPER":
     log.error(f"[SAFETY] MODE must be PAPER — got '{MODE}'. Refusing to start.")
     sys.exit(1)
 
 log.info("=" * 60)
-log.info("  PHASE 31 WEEK 1 — REAL-TIME XAU/USD FEED")
-log.info("  MODE: PAPER (no live trading)")
+log.info("  PHASE 31 — REAL-TIME XAU/USD FEED")
+log.info(f"  MODE: {MODE} (no live trading)")
 log.info("=" * 60)
 
-# ──────────────────────────────────────────────────────────────
-# Feed + callbacks
-# ──────────────────────────────────────────────────────────────
 feed = FinnhubRealTimeFeed()
 
 
@@ -59,7 +52,6 @@ def on_m5_close(candle):
         f"L={candle['low']:.2f} C={candle['close']:.2f} "
         f"ticks={candle.get('ticks', 0)}"
     )
-    # TODO Week 2: run Brain 1/2/3 + AI Judge here
 
 
 def on_h1_close(candle):
@@ -74,9 +66,6 @@ feed.on_m5_close.append(on_m5_close)
 feed.on_h1_close.append(on_h1_close)
 
 
-# ──────────────────────────────────────────────────────────────
-# Health monitor (runs every 30s on its own thread)
-# ──────────────────────────────────────────────────────────────
 def health_monitor():
     while True:
         try:
@@ -98,62 +87,177 @@ def health_monitor():
         time.sleep(30)
 
 
-# ──────────────────────────────────────────────────────────────
-# Tiny HTTP server for Railway healthcheck + remote inspection
-# ──────────────────────────────────────────────────────────────
-class StatusHandler(BaseHTTPRequestHandler):
+class APIHandler(BaseHTTPRequestHandler):
     def _send(self, code: int, payload: dict):
         body = json.dumps(payload, default=str).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
     def do_GET(self):
-        if self.path == "/" or self.path == "/health":
+        path = urlparse(self.path).path.rstrip("/") or "/"
+
+        if path in ("/", "/health"):
             self._send(200, {
                 "status":    "ok",
-                "service":   "phase31-week1",
+                "service":   "phase31",
                 "mode":      MODE,
                 "connected": feed.stream_connected,
                 "healthy":   feed.is_healthy(),
                 "age_ms":    feed.get_data_age_ms(),
                 "price":     feed.latest_mid,
+                "m5_count":  len(feed.m5_history),
+                "m15_count": len(feed.m15_history),
+                "h1_count":  len(feed.h1_history),
+                "h4_count":  len(feed.h4_history),
+                "timestamp": int(time.time()),
             })
-        elif self.path == "/snapshot":
-            self._send(200, feed.snapshot())
-        else:
-            self._send(404, {"error": "not found"})
+            return
 
-    def log_message(self, format, *args):
-        return  # silence default access logs
+        if path == "/snapshot":
+            self._send(200, feed.snapshot())
+            return
+
+        if path == "/live-price":
+            price = feed.latest_mid
+            if price is None:
+                self._send(200, {
+                    "price":   None,
+                    "close":   None,
+                    "symbol":  "XAU/USD",
+                    "ts":      int(time.time()),
+                    "healthy": False,
+                    "error":   "no ticks yet",
+                })
+                return
+            self._send(200, {
+                "price":     round(price, 2),
+                "close":     round(price, 2),
+                "symbol":    "XAU/USD",
+                "ts":        int(time.time()),
+                "age_ms":    feed.get_data_age_ms(),
+                "healthy":   feed.is_healthy(),
+                "source":    "finnhub_ws",
+            })
+            return
+
+        if path == "/status":
+            price = feed.latest_mid
+            price_rounded = round(price, 2) if price else None
+            data_ok = feed.is_healthy()
+            data_msg = (
+                f"Finnhub WS · age {feed.get_data_age_ms()}ms · "
+                f"{len(feed.m5_history)} M5 bars"
+                if price
+                else "Waiting for Finnhub ticks"
+            )
+
+            self._send(200, {
+                "signal":     "WAIT",
+                "confidence": 0,
+                "price":      price_rounded,
+                "health": {
+                    "data_feed":   {"ok": data_ok, "msg": data_msg},
+                    "brain1":      {"ok": False,  "msg": "not wired yet"},
+                    "brain2":      {"ok": False,  "msg": "not wired yet"},
+                    "brain3":      {"ok": False,  "msg": "not wired yet"},
+                    "h4":          {"ok": False,  "msg": "not wired yet"},
+                    "telegram":    {"ok": True,   "msg": "standby"},
+                    "daily_limit": {"ok": True,   "msg": "OK — paper mode"},
+                },
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S+00:00",
+                                           time.gmtime()),
+                "session":         "LIVE (paper)",
+                "session_quality": "LIVE" if data_ok else "N/A",
+                "session_trade_ok": False,
+                "session_icon":    "🟢" if data_ok else "🟡",
+                "last_run": time.strftime("%Y-%m-%dT%H:%M:%S+00:00",
+                                          time.gmtime()),
+                "improvements": "PHASE_31",
+                "mode": MODE,
+            })
+            return
+
+        if path == "/chart-data":
+            qs = parse_qs(urlparse(self.path).query)
+            tf = qs.get("tf", ["m5"])[0].lower()
+
+            tf_map = {
+                "m5":  feed.m5_history,
+                "m15": feed.m15_history,
+                "h1":  feed.h1_history,
+                "h4":  feed.h4_history,
+            }
+            if tf not in tf_map:
+                self._send(400, {"error": f"unknown tf: {tf}"})
+                return
+
+            bars = [
+                {
+                    "time":   c["time"],
+                    "open":   round(c["open"],  2),
+                    "high":   round(c["high"],  2),
+                    "low":    round(c["low"],   2),
+                    "close":  round(c["close"], 2),
+                    "volume": c.get("ticks", 0),
+                }
+                for c in list(tf_map[tf])
+            ]
+
+            live_attr = getattr(feed, f"live_{tf}", None)
+            if live_attr:
+                bars.append({
+                    "time":   live_attr["time"],
+                    "open":   round(live_attr["open"],  2),
+                    "high":   round(live_attr["high"],  2),
+                    "low":    round(live_attr["low"],   2),
+                    "close":  round(live_attr["close"], 2),
+                    "volume": live_attr.get("ticks", 0),
+                    "live":   True,
+                })
+
+            self._send(200, {
+                "symbol": "XAU/USD",
+                "tf":     tf,
+                "bars":   bars,
+                "count":  len(bars),
+                "source": "finnhub_ws_live",
+            })
+            return
+
+        self._send(404, {"error": "not found", "path": path})
 
 
 def run_http():
     port = int(os.getenv("PORT", "8080"))
-    srv = HTTPServer(("0.0.0.0", port), StatusHandler)
+    srv = HTTPServer(("0.0.0.0", port), APIHandler)
     log.info(f"[HTTP] Listening on 0.0.0.0:{port}")
+    log.info("[HTTP] Endpoints: / /health /snapshot /live-price /status /chart-data?tf=m5")
     srv.serve_forever()
 
 
-# ──────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────
 def main():
-    # 1. Seed history from Twelve Data
     bootstrap_all(feed)
-
-    # 2. Start Finnhub WebSocket (background thread)
     feed.start()
     log.info("[MAIN] Finnhub feed started")
-
-    # 3. Start health monitor (background thread)
     threading.Thread(target=health_monitor, daemon=True, name="health").start()
     log.info("[MAIN] Health monitor started")
-
-    # 4. Start HTTP server (blocks main thread)
     run_http()
 
 
